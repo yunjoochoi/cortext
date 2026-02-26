@@ -1,0 +1,8 @@
+paddleocr==3.4.0
+paddlex==3.4.2
+torch==2.7.1
+numpy==2.4.2
+opencv-contrib-python==4.10.0.84
+pillow==12.1.1
+tqdm==4.67.3
+pyyaml

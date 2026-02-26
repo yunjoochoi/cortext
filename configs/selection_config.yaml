@@ -1,0 +1,16 @@
+data:
+  data_root: "/scratch2/shaush/030.야외_실제_촬영_한글_이미지"
+  label_subdir: "[라벨]Training"
+  source_subdirs:
+    - "[원천]Training_간판_가로형간판_원천데이터1"
+    - "[원천]Training_간판_가로형간판_원천데이터2"
+  output_dir: "/scratch2/shaush/coreset_output"
+
+embedding:
+  # pretrained: override URL or local path (optional, uses default if omitted)
+  batch_size: 256
+
+selection:
+  k: 100000
+  seed: 42
+
