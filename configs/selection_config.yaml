@@ -13,4 +13,5 @@ embedding:
 selection:
   k: 100000
   seed: 42
+  category_filter: "1.간판/1.가로형간판/가로형간판1"  # null = all categories
 

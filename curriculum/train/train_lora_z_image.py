@@ -63,6 +63,7 @@ from torch.utils.data.sampler import BatchSampler
 from torchvision import transforms
 from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
+import torch.nn.functional as F
 from transformers import Qwen2Tokenizer, Qwen3Model
 
 import diffusers
@@ -717,6 +718,24 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--contrastive_loss_coeff",
+        type=float,
+        default=0.0,
+        help="Weight for EvoGen-style contrastive loss. 0 disables it.",
+    )
+    parser.add_argument(
+        "--hard_negatives_jsonl",
+        type=str,
+        default=None,
+        help="Path to hard_negatives.jsonl produced by hard_negative_gen.py.",
+    )
+    parser.add_argument(
+        "--contrastive_proj_dim",
+        type=int,
+        default=256,
+        help="Projection dimension for contrastive image/text embeddings.",
+    )
     parser.add_argument("--enable_npu_flash_attention", action="store_true", help="Enabla Flash Attention for NPU")
     parser.add_argument("--fsdp_text_encoder", action="store_true", help="Use FSDP for text encoder")
 
@@ -750,6 +769,46 @@ def parse_args(input_args=None):
             warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
     return args
+
+
+class ImageProjector(torch.nn.Module):
+    """Projects mean-pooled VAE latents [B, C, H, W] → contrastive space [B, out_dim]."""
+
+    def __init__(self, in_channels: int, out_dim: int):
+        super().__init__()
+        self.proj = torch.nn.Linear(in_channels, out_dim, bias=False)
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.proj(latents.mean(dim=[2, 3]))
+
+
+class TextProjector(torch.nn.Module):
+    """Projects mean-pooled token embeddings (List[Tensor]) → contrastive space [B, out_dim]."""
+
+    def __init__(self, text_dim: int, out_dim: int):
+        super().__init__()
+        self.proj = torch.nn.Linear(text_dim, out_dim, bias=False)
+
+    def forward(self, token_embeds: list[torch.Tensor]) -> torch.Tensor:
+        pooled = torch.stack([e.float().mean(dim=0) for e in token_embeds])
+        return self.proj(pooled)
+
+
+def compute_contrastive_loss(
+    pos_text: torch.Tensor,
+    pos_img: torch.Tensor,
+    neg_img: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """InfoNCE: pull pos_img toward pos_text, push neg_img away."""
+    pos_img  = F.normalize(pos_img.float(),  dim=-1)
+    neg_img  = F.normalize(neg_img.float(),  dim=-1)
+    pos_text = F.normalize(pos_text.float(), dim=-1)
+    logits = torch.cat(
+        [pos_img @ pos_text.t(), neg_img @ pos_text.t()], dim=1
+    ) / temperature
+    labels = torch.zeros(len(logits), dtype=torch.long, device=pos_text.device)
+    return F.cross_entropy(logits, labels)
 
 
 class DreamBoothDataset(Dataset):
@@ -830,6 +889,15 @@ class DreamBoothDataset(Dataset):
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
                     self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
+
+            # Track annotation_ids if available (needed for contrastive neg lookup)
+            if "annotation_id" in column_names:
+                raw_ids = dataset["train"]["annotation_id"]
+                self.annotation_ids = []
+                for aid in raw_ids:
+                    self.annotation_ids.extend(itertools.repeat(aid, repeats))
+            else:
+                self.annotation_ids = None
         else:
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
@@ -837,6 +905,7 @@ class DreamBoothDataset(Dataset):
 
             instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
             self.custom_instance_prompts = None
+            self.annotation_ids = None
 
         self.instance_images = []
         for img in instance_images:
@@ -915,6 +984,9 @@ class DreamBoothDataset(Dataset):
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt"] = self.class_prompt
 
+        if self.annotation_ids is not None:
+            example["annotation_id"] = self.annotation_ids[index % self.num_instance_images]
+
         return example
 
     def train_transform(self, image, size=(224, 224), center_crop=False, random_flip=False):
@@ -959,6 +1031,8 @@ def collate_fn(examples, with_prior_preservation=False):
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
     batch = {"pixel_values": pixel_values, "prompts": prompts}
+    if "annotation_id" in examples[0]:
+        batch["annotation_ids"] = [e["annotation_id"] for e in examples]
     return batch
 
 
@@ -1226,6 +1300,44 @@ def main(args):
         )
 
     text_encoder.to(**to_kwargs)
+
+    # Contrastive projectors — created while both VAE and text_encoder are in scope
+    image_projector = None
+    text_projector  = None
+    neg_latents_lookup: dict[str, torch.Tensor] = {}
+    if args.contrastive_loss_coeff > 0:
+        image_projector = ImageProjector(vae.config.latent_channels, args.contrastive_proj_dim)
+        text_projector  = TextProjector(text_encoder.config.hidden_size, args.contrastive_proj_dim)
+        image_projector = image_projector.to(accelerator.device, dtype=weight_dtype)
+        text_projector  = text_projector.to(accelerator.device, dtype=weight_dtype)
+
+        # Pre-encode neg images while VAE is on device
+        if args.hard_negatives_jsonl:
+            neg_json: dict[str, list[str]] = {}
+            with open(args.hard_negatives_jsonl) as f:
+                for _line in f:
+                    _rec = json.loads(_line)
+                    neg_json.setdefault(_rec["anchor_id"], []).append(_rec["neg_image_path"])
+            logger.info(f"Pre-encoding {len(neg_json)} neg sets from {args.hard_negatives_jsonl}")
+            _enc_size = args.resolution if isinstance(args.resolution, int) else args.resolution[0]
+            _neg_tf = transforms.Compose([
+                transforms.Resize((_enc_size, _enc_size), interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ])
+            with offload_models(vae, device=accelerator.device, offload=args.offload):
+                with torch.no_grad():
+                    for _aid, _paths in neg_json.items():
+                        try:
+                            _img = Image.open(random.choice(_paths)).convert("RGB")
+                            _t   = _neg_tf(_img).unsqueeze(0).to(accelerator.device, dtype=vae.dtype)
+                            _lat = vae.encode(_t).latent_dist.mode()
+                            _lat = (_lat - vae_config_shift_factor) * vae_config_scaling_factor
+                            neg_latents_lookup[_aid] = _lat.cpu()
+                        except Exception as _e:
+                            logger.warning(f"Skip neg for {_aid}: {_e}")
+            logger.info(f"Pre-encoded {len(neg_latents_lookup)} neg latents")
+
     # Initialize a text encoding pipeline and keep it to CPU for now.
     text_encoding_pipeline = ZImagePipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1372,6 +1484,11 @@ def main(args):
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
+    if image_projector is not None:
+        params_to_optimize += [
+            {"params": image_projector.parameters(), "lr": args.learning_rate},
+            {"params": text_projector.parameters(),  "lr": args.learning_rate},
+        ]
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1561,9 +1678,14 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
-    )
+    if image_projector is not None:
+        transformer, image_projector, text_projector, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, image_projector, text_projector, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1737,6 +1859,32 @@ def main(args):
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
 
+                # EvoGen-style contrastive loss (image projector vs text projector)
+                c_loss_val = 0.0
+                if args.contrastive_loss_coeff > 0 and image_projector is not None and neg_latents_lookup:
+                    ann_ids = batch.get("annotation_ids", [])
+                    neg_lats, valid_idx = [], []
+                    for _i, _aid in enumerate(ann_ids):
+                        if _aid in neg_latents_lookup:
+                            neg_lats.append(neg_latents_lookup[_aid].to(model_input.device, dtype=model_input.dtype))
+                            valid_idx.append(_i)
+                    if neg_lats and len(neg_lats) == len(ann_ids):
+                        neg_lat = torch.cat(neg_lats, dim=0)
+                        pos_lat = model_input[valid_idx]
+                        # Align spatial dims if neg was encoded at different resolution
+                        if neg_lat.shape[-2:] != pos_lat.shape[-2:]:
+                            neg_lat = torch.nn.functional.interpolate(
+                                neg_lat, size=pos_lat.shape[-2:], mode="bilinear", align_corners=False
+                            )
+                        pos_img_embed = image_projector(pos_lat)
+                        neg_img_embed = image_projector(neg_lat)
+                        # prompt_embeds is List[Tensor[seq_len, hidden_dim]] for Z-Image
+                        pe_subset = [prompt_embeds[i] for i in valid_idx]
+                        pos_text_embed = text_projector(pe_subset).to(pos_img_embed.device)
+                        c_loss = compute_contrastive_loss(pos_text_embed, pos_img_embed, neg_img_embed)
+                        loss = loss + args.contrastive_loss_coeff * c_loss
+                        c_loss_val = c_loss.detach().item()
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = transformer.parameters()
@@ -1778,6 +1926,8 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if args.contrastive_loss_coeff > 0:
+                logs["c_loss"] = c_loss_val
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 

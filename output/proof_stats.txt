@@ -1,0 +1,10 @@
+=== Glyph Similarity Proof Statistics ===
+
+intra     : n= 2000  mean=5.9471  std=2.2527  median=5.5963
+jamo_off  : n= 2000  mean=6.3161  std=1.8670  median=6.0235
+random    : n= 2000  mean=8.0954  std=2.2916  median=7.7806
+
+Cohen's d (jamo_off - intra): 0.178  (small)
+Cohen's d (random - jamo_off): 0.851  (large)
+
+Ordering intra < jamo_off < random: ✓ PASS

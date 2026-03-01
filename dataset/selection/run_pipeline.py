@@ -7,9 +7,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from module.data_conditioning import OCREmbeddingExtractor
-from module.coreset_selection import run_selection
-from module.output_finalization import export_selected
+from ocr_embedding_extracting import OCREmbeddingExtractor
+from kcenter_greedy import run_selection
+from export_selected import export_selected
 
 
 def main(config_path: str = None):
@@ -41,6 +41,8 @@ def main(config_path: str = None):
         k=cfg["selection"]["k"],
         output_path=str(selected_path),
         seed=cfg["selection"]["seed"],
+        manifest_path=str(manifest_path),
+        category_filter=cfg["selection"].get("category_filter"),
     )
 
     print("\n=== Phase 3: Exporting selected coreset ===")

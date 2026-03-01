@@ -12,8 +12,8 @@ import yaml
 from pathlib import Path
 from tqdm import tqdm
 
-from module.data_conditioning.crop_and_preprocess import batch_iterator
-from module.data_conditioning.ppocr import build_model
+from crop_and_preprocess import batch_iterator
+from ppocr import build_model
 
 SHARD_SIZE = 50_000
 PRETRAINED_URL = (
