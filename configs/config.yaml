@@ -1,0 +1,43 @@
+data:
+  data_root: "/scratch2/shaush/030.야외_실제_촬영_한글_이미지"
+  label_subdir: "[라벨]Training"
+  source_subdirs:
+    - "[원천]Training_간판_가로형간판_원천데이터1"
+    - "[원천]Training_간판_가로형간판_원천데이터2"
+  output_dir: "/scratch2/shaush/coreset_output"
+  annotation_dir: "/scratch2/shaush/annotation_output"
+
+selection:
+  seed: 42
+  freq_threshold: 500
+  beta: 0.0001
+  category_filter: null  # null = all categories
+
+hard_negative:
+  coverage_cap: 500
+
+inpainting:
+  model_id: "Fantasy-Studio/Paint-by-Example"
+  font_path: "NotoSansKR-VariableFont_wght.ttf"
+
+training:
+  pretrained_model_name_or_path: "/scratch2/shaush/models/models--Tongyi-MAI--Z-Image"
+  output_dir: "/scratch2/shaush/training_output/curriculum_lora"
+  resolution: 512
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_train_steps_per_phase: 500
+  learning_rate: 1e-4
+  rank: 16
+  mixed_precision: "bf16"
+  contrastive_proj_dim: 1024
+  checkpointing_steps: 500
+
+curriculum:
+  phases:
+    - name: "easy"
+      contrastive_coeff: 0.01
+    - name: "medium"
+      contrastive_coeff: 0.05
+    - name: "hard"
+      contrastive_coeff: 0.10
