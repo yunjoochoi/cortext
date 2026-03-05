@@ -33,7 +33,6 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 
-import diffusers
 from diffusers import (
     AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
@@ -47,7 +46,6 @@ from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
     free_memory,
-    offload_models,
 )
 from diffusers.utils import convert_unet_state_dict_to_peft
 from diffusers.utils.torch_utils import is_compiled_module
@@ -156,8 +154,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir),
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+        project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=str(logging_dir)),
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
     )
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO)
 
@@ -171,6 +169,11 @@ def main():
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
+
+    # Validate resolution (must be divisible by vae_scale_factor * 2 = 16)
+    vae_align = 16
+    if args.height % vae_align != 0 or args.width % vae_align != 0:
+        raise ValueError(f"height ({args.height}) and width ({args.width}) must be divisible by {vae_align}")
 
     # ---- Load models ----
     tokenizer = Qwen2Tokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -191,10 +194,9 @@ def main():
     transformer.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
-    to_kwargs = {"dtype": weight_dtype, "device": accelerator.device} if not args.offload else {"dtype": weight_dtype}
-    vae.to(**to_kwargs)
+    vae.to(device=accelerator.device, dtype=weight_dtype)
     transformer.to(device=accelerator.device, dtype=weight_dtype)
-    text_encoder.to(**to_kwargs)
+    text_encoder.to(device=accelerator.device, dtype=weight_dtype)
 
     # ---- LoRA ----
     lora_config = LoraConfig(
@@ -209,9 +211,9 @@ def main():
         cast_training_params([transformer], dtype=torch.float32)
 
     # ---- Text encoding pipeline (reuses text_encoder + tokenizer) ----
-    text_encoding_pipeline = ZImagePipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=None, transformer=None, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=None,
+    text_encoding_pipeline = ZImagePipeline(
+        vae=vae, transformer=transformer, tokenizer=tokenizer,
+        text_encoder=text_encoder, scheduler=noise_scheduler,
     )
 
     def encode_prompts(prompts):
@@ -233,23 +235,8 @@ def main():
     logger.info(f"Dataset: {len(train_dataset):,} samples")
 
     # ---- Pre-cache latents & prompt embeddings ----
-    if args.cache_latents:
-        logger.info("Caching latents and prompt embeddings...")
-        latents_cache = []
-        prompt_embeds_cache = []
-        for batch in tqdm(train_dataloader, desc="Caching"):
-            with torch.no_grad():
-                with offload_models(vae, device=accelerator.device, offload=args.offload):
-                    pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                    latents_cache.append(vae.encode(pv).latent_dist)
-                with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
-                    prompt_embeds_cache.append(encode_prompts(batch["prompts"]))
-        vae = vae.to("cpu")
-        del vae
-        text_encoding_pipeline = text_encoding_pipeline.to("cpu")
-        del text_encoder, tokenizer
-        free_memory()
-        logger.info(f"Cached {len(latents_cache)} batches")
+    # Caching must happen AFTER accelerator.prepare() to match dataloader order on multi-GPU.
+    # We defer it to after prepare below.
 
     # ---- Optimizer ----
     trainable_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
@@ -267,8 +254,8 @@ def main():
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler, optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
     # ---- Accelerate prepare ----
@@ -280,6 +267,23 @@ def main():
         accelerator.init_trackers("z-image-lora-simple", config=vars(args))
     if args.allow_tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ---- Pre-cache latents & prompt embeddings (after prepare, using prepared dataloader) ----
+    latents_cache = []
+    prompt_embeds_cache = []
+    if args.cache_latents:
+        logger.info("Caching latents and prompt embeddings...")
+        for batch in tqdm(train_dataloader, desc="Caching", disable=not accelerator.is_local_main_process):
+            with torch.no_grad():
+                pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                latents_cache.append(vae.encode(pv).latent_dist)
+                prompt_embeds_cache.append(encode_prompts(batch["prompts"]))
+        vae = vae.to("cpu")
+        del vae
+        text_encoding_pipeline.to("cpu")
+        del text_encoder, tokenizer
+        free_memory()
+        logger.info(f"Cached {len(latents_cache)} batches")
 
     # ---- Save/Load hooks ----
     def unwrap(model):
@@ -344,15 +348,13 @@ def main():
             with accelerator.accumulate(transformer):
                 # Encode
                 if args.cache_latents:
-                    prompt_embeds = prompt_embeds_cache[step]
-                    model_input = latents_cache[step].mode()
+                    prompt_embeds = prompt_embeds_cache[step % len(prompt_embeds_cache)]
+                    model_input = latents_cache[step % len(latents_cache)].mode()
                 else:
                     with torch.no_grad():
-                        with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
-                            prompt_embeds = encode_prompts(batch["prompts"])
-                        with offload_models(vae, device=accelerator.device, offload=args.offload):
-                            pv = batch["pixel_values"].to(dtype=vae.dtype)
-                            model_input = vae.encode(pv).latent_dist.mode()
+                        prompt_embeds = encode_prompts(batch["prompts"])
+                        pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                        model_input = vae.encode(pv).latent_dist.mode()
 
                 model_input = (model_input - vae_shift) * vae_scale
                 noise = torch.randn_like(model_input)
@@ -387,7 +389,7 @@ def main():
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()

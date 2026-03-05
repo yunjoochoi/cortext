@@ -13,9 +13,4 @@ export HF_HUB_OFFLINE=1
 
 TRAIN_OUT=/scratch2/shaush/training_output/kandinsky_inpaint_lora
 
-python training/infer_kandinsky_inpaint_lora.py \
-    --training_dir ${TRAIN_OUT} \
-    --output_dir /home/shaush/cortext/kd_inference \
-    --lora_rank 16 \
-    --dtype fp16 \
-    --baseline
+python cortext/inference/test_zimage.py
