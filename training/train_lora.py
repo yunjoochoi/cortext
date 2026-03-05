@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument("--manifest_jsonl", required=True, help="Scored manifest (1 record = 1 textbox)")
     p.add_argument("--hard_negatives_jsonl", default=None, help="Hard negatives with neg_image_path")
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--resolution", type=int, default=512)
+    p.add_argument("--resolution", type=int, default=1200)
     p.add_argument("--train_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--max_train_steps", type=int, default=1000)

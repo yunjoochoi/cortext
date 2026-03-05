@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=inpaint
-#SBATCH --partition=dell_rtx3090
+#SBATCH --partition=gigabyte_a6000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=24:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --output=logs/inpaint_%j.log
 
-source activate cortext
+eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
 
 OUT=/scratch2/shaush/coreset_output

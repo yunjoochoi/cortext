@@ -6,7 +6,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/curriculum_%j.log
 
-source activate cortext
+eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
 
 OUT=/scratch2/shaush/coreset_output

@@ -23,7 +23,7 @@ inpainting:
 training:
   pretrained_model_name_or_path: "/scratch2/shaush/models/models--Tongyi-MAI--Z-Image"
   output_dir: "/scratch2/shaush/training_output/curriculum_lora"
-  resolution: 512
+  resolution: 1200  # 1600x1200 images, short side
   train_batch_size: 1
   gradient_accumulation_steps: 4
   max_train_steps_per_phase: 500

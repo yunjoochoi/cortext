@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=manifest
+#SBATCH --job-name=qwen_edit
 #SBATCH --partition=gigabyte_a6000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=02:00:00
-#SBATCH --output=logs/manifest_%j.log
+#SBATCH --output=logs/qwen_edit_%j.log
 
 eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
 
-python dataset/manifest.py --category_filter "1.간판/1.가로형간판/가로형간판1"
+python training/test_qwen_edit.py

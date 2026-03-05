@@ -1,4 +1,4 @@
-"""LoRA fine-tuning for Kandinsky 2.2 inpaint decoder on Korean signage data."""
+"""Kandinsky 2.2 t2i decoder LoRA fine-tuning with bbox-masked loss for Korean signage."""
 
 import argparse
 import json
@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -20,24 +19,24 @@ from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict
-
 from diffusers import DDPMScheduler, UNet2DConditionModel, VQModel
 from diffusers.optimization import get_scheduler
 
 logger = get_logger(__name__, log_level="INFO")
+
+MOVQ_SCALE_FACTOR = 8
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
-class InpaintDataset(torch.utils.data.Dataset):
-    """Loads manifest.jsonl records with image_path, bbox [x,y,w,h], text."""
+class T2IDataset(torch.utils.data.Dataset):
+    """Per-textbox dataset. Each record has image_path, bbox [x,y,w,h]."""
 
     def __init__(self, manifest_path: str, resolution: int, image_processor: CLIPImageProcessor):
         with open(manifest_path) as f:
-            self.records = [json.loads(line) for line in f]
+            self.records = [json.loads(line) for line in f if line.strip()]
         self.resolution = resolution
         self.image_processor = image_processor
 
@@ -54,41 +53,56 @@ class InpaintDataset(torch.utils.data.Dataset):
         left = (orig_w - crop_size) / 2
         top = (orig_h - crop_size) / 2
         img = img.crop((left, top, left + crop_size, top + crop_size))
-
-        # Resize
         img = img.resize((self.resolution, self.resolution), resample=Image.BICUBIC, reducing_gap=1)
-
-        # Build mask from bbox [x, y, w, h] in original image coords
-        bx, by, bw, bh = rec["bbox"]
-        scale = self.resolution / crop_size
-        mx = int((bx - left) * scale)
-        my = int((by - top) * scale)
-        mw = int(bw * scale)
-        mh = int(bh * scale)
-
-        mask = np.zeros((self.resolution, self.resolution), dtype=np.float32)
-        x1 = max(0, mx)
-        y1 = max(0, my)
-        x2 = min(self.resolution, mx + mw)
-        y2 = min(self.resolution, my + mh)
-        if x2 > x1 and y2 > y1:
-            mask[y1:y2, x1:x2] = 1.0
 
         # Image → tensor [-1, 1]
         pixel_values = np.array(img).astype(np.float32) / 127.5 - 1.0
         pixel_values = torch.from_numpy(pixel_values.transpose(2, 0, 1))
 
-        # CLIP preprocessing
+        # CLIP preprocessing for image_embeds conditioning
         clip_pixel_values = self.image_processor(img, return_tensors="pt").pixel_values.squeeze(0)
 
-        # Mask → tensor (1, H, W)
-        mask = torch.from_numpy(mask).unsqueeze(0)
+        # Build bbox mask at latent resolution
+        mask = self._build_latent_mask(rec["bbox"], orig_w, orig_h, crop_size, left, top)
 
         return {
             "pixel_values": pixel_values,
             "clip_pixel_values": clip_pixel_values,
             "mask": mask,
         }
+
+    def _build_latent_mask(
+        self, bbox: list[float], orig_w: int, orig_h: int,
+        crop_size: int, crop_left: float, crop_top: float,
+    ) -> torch.Tensor:
+        res = self.resolution
+        scale = res / crop_size
+
+        bx, by, bw, bh = bbox
+        mx = int((bx - crop_left) * scale)
+        my = int((by - crop_top) * scale)
+        mw = int(bw * scale)
+        mh = int(bh * scale)
+
+        # Pixel-space clamp
+        x1 = max(0, min(mx, res))
+        y1 = max(0, min(my, res))
+        x2 = max(0, min(mx + mw, res))
+        y2 = max(0, min(my + mh, res))
+
+        # Convert to latent space
+        latent_size = res // MOVQ_SCALE_FACTOR
+        lx1 = x1 // MOVQ_SCALE_FACTOR
+        ly1 = y1 // MOVQ_SCALE_FACTOR
+        lx2 = max(lx1 + 1, x2 // MOVQ_SCALE_FACTOR)
+        ly2 = max(ly1 + 1, y2 // MOVQ_SCALE_FACTOR)
+        lx2 = min(lx2, latent_size)
+        ly2 = min(ly2, latent_size)
+
+        mask = torch.zeros(1, latent_size, latent_size)
+        if lx2 > lx1 and ly2 > ly1:
+            mask[0, ly1:ly2, lx1:lx2] = 1.0
+        return mask
 
 
 def collate_fn(examples: list[dict]) -> dict:
@@ -104,13 +118,15 @@ def collate_fn(examples: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="LoRA fine-tuning for Kandinsky 2.2 inpaint decoder.")
+    p = argparse.ArgumentParser(description="Kandinsky 2.2 t2i decoder LoRA with bbox-masked loss.")
     p.add_argument("--pretrained_decoder_model_name_or_path", type=str,
-                    default="kandinsky-community/kandinsky-2-2-decoder-inpaint")
+                    default="kandinsky-community/kandinsky-2-2-decoder",
+                    help="Kandinsky 2.2 t2i decoder (4ch UNet)")
     p.add_argument("--pretrained_prior_model_name_or_path", type=str,
                     default="kandinsky-community/kandinsky-2-2-prior")
-    p.add_argument("--manifest_path", type=str, required=True)
-    p.add_argument("--output_dir", type=str, default="kandinsky-inpaint-lora")
+    p.add_argument("--manifest_path", type=str, required=True,
+                    help="JSONL manifest with image_path, bbox [x,y,w,h]")
+    p.add_argument("--output_dir", type=str, default="kandinsky-t2i-lora")
     p.add_argument("--resolution", type=int, default=1200)
     p.add_argument("--train_batch_size", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=None)
@@ -171,7 +187,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # Load models
+    # Load models — t2i decoder (4ch UNet), not inpaint (9ch)
     # -----------------------------------------------------------------------
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_decoder_model_name_or_path, subfolder="scheduler"
@@ -189,7 +205,8 @@ def main():
         args.pretrained_decoder_model_name_or_path, subfolder="unet"
     )
 
-    # Freeze everything
+    logger.info(f"UNet in_channels: {unet.config.in_channels}")  # should be 4
+
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     image_encoder.requires_grad_(False)
@@ -205,7 +222,7 @@ def main():
     image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # -----------------------------------------------------------------------
-    # LoRA setup (PEFT)
+    # LoRA
     # -----------------------------------------------------------------------
     unet_lora_config = LoraConfig(
         r=args.rank,
@@ -232,21 +249,14 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
-    optimizer = optimizer_cls(
-        lora_params,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=0.0,
-        eps=1e-8,
-    )
+    optimizer = optimizer_cls(lora_params, lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
 
     # -----------------------------------------------------------------------
     # Dataset & DataLoader
     # -----------------------------------------------------------------------
-    train_dataset = InpaintDataset(args.manifest_path, args.resolution, image_processor)
+    train_dataset = T2IDataset(args.manifest_path, args.resolution, image_processor)
     if args.max_train_samples is not None:
         train_dataset.records = train_dataset.records[:args.max_train_samples]
-
     logger.info(f"Dataset size: {len(train_dataset)}")
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -283,7 +293,7 @@ def main():
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("kandinsky-inpaint-lora", config=vars(args))
+        accelerator.init_trackers("kandinsky-t2i-lora", config=vars(args))
 
     # -----------------------------------------------------------------------
     # Training loop
@@ -337,15 +347,13 @@ def main():
             with accelerator.accumulate(unet):
                 images = batch["pixel_values"].to(weight_dtype)
                 clip_images = batch["clip_pixel_values"].to(weight_dtype)
-                mask = batch["mask"].to(weight_dtype)  # (B, 1, H, W)
+                mask = batch["mask"].to(weight_dtype)  # (B, 1, latent_h, latent_w)
 
-                # Encode image → latents
+                # Encode image → latents via MoVQ
                 latents = vae.encode(images).latents
-                image_embeds = image_encoder(clip_images).image_embeds
 
-                # Mask at latent resolution
-                mask_latent = F.interpolate(mask, latents.shape[-2:], mode="nearest")
-                masked_image = latents * (1 - mask_latent)
+                # CLIP image → image_embeds (conditioning)
+                image_embeds = image_encoder(clip_images).image_embeds
 
                 # Add noise
                 noise = torch.randn_like(latents)
@@ -355,18 +363,18 @@ def main():
                 ).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # 9-channel input: [noisy_latents(4), masked_image(4), mask(1)]
-                latent_input = torch.cat([noisy_latents, masked_image, mask_latent], dim=1)
-
+                # Standard 4ch t2i forward (no mask/masked_image concat)
                 added_cond_kwargs = {"image_embeds": image_embeds}
                 model_pred = unet(
-                    latent_input, timesteps, None, added_cond_kwargs=added_cond_kwargs
+                    noisy_latents, timesteps, None, added_cond_kwargs=added_cond_kwargs
                 ).sample[:, :4]
 
                 target = noise
 
+                # Bbox-masked loss: only propagate error in text regions
                 if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = (mse * mask).sum() / mask.sum().clamp(min=1.0)
                 else:
                     from diffusers.training_utils import compute_snr
                     snr = compute_snr(noise_scheduler, timesteps)
@@ -375,9 +383,11 @@ def main():
                     ).min(dim=1)[0]
                     if noise_scheduler.config.prediction_type == "epsilon":
                         mse_loss_weights = mse_loss_weights / snr
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+
+                    mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    # Per-sample masked mean, then apply SNR weights
+                    per_sample_loss = (mse * mask).sum(dim=[1, 2, 3]) / mask.sum(dim=[1, 2, 3]).clamp(min=1.0)
+                    loss = (per_sample_loss * mse_loss_weights).mean()
 
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
@@ -402,7 +412,7 @@ def main():
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                for c in checkpoints[: len(checkpoints) - args.checkpoints_total_limit + 1]:
+                                for c in checkpoints[:len(checkpoints) - args.checkpoints_total_limit + 1]:
                                     shutil.rmtree(os.path.join(args.output_dir, c))
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
