@@ -1,4 +1,4 @@
-"""Korean jamo decomposition, composition, and visual confusability matrix."""
+"""Korean jamo decomposition, composition, and confusable pair filter."""
 
 CHOSUNG = ['ㄱ','ㄲ','ㄴ','ㄷ','ㄸ','ㄹ','ㅁ','ㅂ','ㅃ','ㅅ','ㅆ','ㅇ','ㅈ','ㅉ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ']
 JUNGSUNG = ['ㅏ','ㅐ','ㅑ','ㅒ','ㅓ','ㅔ','ㅕ','ㅖ','ㅗ','ㅘ','ㅙ','ㅚ','ㅛ','ㅜ','ㅝ','ㅞ','ㅟ','ㅠ','ㅡ','ㅢ','ㅣ']
@@ -10,22 +10,22 @@ _JONG_IDX = {c: i for i, c in enumerate(JONGSUNG)}
 
 _SIMPLE_JONG = {'ㄱ','ㄲ','ㄴ','ㄷ','ㄹ','ㅁ','ㅂ','ㅅ','ㅆ','ㅇ','ㅈ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ'}
 
-# (jamo_a, jamo_b, severity) — 1.0=most confusable, 0.4=easily distinguished
-CONFUSABLE_PAIRS: list[tuple[str, str, float]] = [
-    ('ㅓ', 'ㅔ', 1.0), ('ㅔ', 'ㅐ', 1.0), ('ㅓ', 'ㅐ', 0.9),
-    ('ㅓ', 'ㅕ', 0.8), ('ㅗ', 'ㅛ', 0.8), ('ㅜ', 'ㅠ', 0.8),
-    ('ㅏ', 'ㅑ', 0.7),
-    ('ㅡ', 'ㅣ', 0.6),
-    ('ㅁ', 'ㅇ', 0.7), ('ㅁ', 'ㅂ', 0.7),
-    ('ㅂ', 'ㅍ', 0.6), ('ㅈ', 'ㅊ', 0.6), ('ㄴ', 'ㄷ', 0.6),
-    ('ㄷ', 'ㅌ', 0.5), ('ㄱ', 'ㅋ', 0.5),
-    ('ㄴ', 'ㄹ', 0.4),
+# Visually confusable jamo pairs (used as filter, not weighted)
+CONFUSABLE_PAIRS: list[tuple[str, str]] = [
+    ('ㅓ', 'ㅔ'), ('ㅔ', 'ㅐ'), ('ㅓ', 'ㅐ'),
+    ('ㅓ', 'ㅕ'), ('ㅗ', 'ㅛ'), ('ㅜ', 'ㅠ'),
+    ('ㅏ', 'ㅑ'),
+    ('ㅡ', 'ㅣ'),
+    ('ㅁ', 'ㅇ'), ('ㅁ', 'ㅂ'),
+    ('ㅂ', 'ㅍ'), ('ㅈ', 'ㅊ'), ('ㄴ', 'ㄷ'),
+    ('ㄷ', 'ㅌ'), ('ㄱ', 'ㅋ'),
+    ('ㄴ', 'ㄹ'), ('ㄴ', 'ㄷ'),
 ]
 
-JAMO_CONFUSABLE: dict[str, list[tuple[str, float]]] = {}
-for a, b, sev in CONFUSABLE_PAIRS:
-    JAMO_CONFUSABLE.setdefault(a, []).append((b, sev))
-    JAMO_CONFUSABLE.setdefault(b, []).append((a, sev))
+JAMO_CONFUSABLE: dict[str, list[str]] = {}
+for a, b in CONFUSABLE_PAIRS:
+    JAMO_CONFUSABLE.setdefault(a, []).append(b)
+    JAMO_CONFUSABLE.setdefault(b, []).append(a)
 
 
 def decompose(char: str) -> tuple[str, str, str]:
@@ -41,28 +41,28 @@ def compose(cho: str, jung: str, jong: str) -> str:
     return chr(0xAC00 + code)
 
 
-def substitute_one_jamo(word: str) -> list[tuple[str, int, str, str, float]]:
-    """Generate all 1-jamo confusable substitutions. Returns (new_word, syl_idx, orig, sub, severity)."""
+def substitute_one_jamo(word: str) -> list[tuple[str, int, str, str]]:
+    """Generate all 1-jamo confusable substitutions. Returns (new_word, syl_idx, orig, sub)."""
     results = []
     for syl_i, char in enumerate(word):
         if not ('가' <= char <= '힣'):
             continue
         cho, jung, jong = decompose(char)
 
-        for alt, sev in JAMO_CONFUSABLE.get(cho, []):
+        for alt in JAMO_CONFUSABLE.get(cho, []):
             if alt in _CHO_IDX:
                 new_word = word[:syl_i] + compose(alt, jung, jong) + word[syl_i + 1:]
-                results.append((new_word, syl_i, cho, alt, sev))
+                results.append((new_word, syl_i, cho, alt))
 
-        for alt, sev in JAMO_CONFUSABLE.get(jung, []):
+        for alt in JAMO_CONFUSABLE.get(jung, []):
             if alt in _JUNG_IDX:
                 new_word = word[:syl_i] + compose(cho, alt, jong) + word[syl_i + 1:]
-                results.append((new_word, syl_i, jung, alt, sev))
+                results.append((new_word, syl_i, jung, alt))
 
         if jong and jong in _SIMPLE_JONG:
-            for alt, sev in JAMO_CONFUSABLE.get(jong, []):
+            for alt in JAMO_CONFUSABLE.get(jong, []):
                 if alt in _JONG_IDX and alt in _SIMPLE_JONG:
                     new_word = word[:syl_i] + compose(cho, jung, alt) + word[syl_i + 1:]
-                    results.append((new_word, syl_i, jong, alt, sev))
+                    results.append((new_word, syl_i, jong, alt))
 
     return results
