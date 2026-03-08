@@ -1,6 +1,8 @@
 """Syllable type classification and type-based difficulty tiers."""
 
 import json
+import math
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -10,17 +12,6 @@ _COMPOUND_VOWELS = {'ㅘ', 'ㅙ', 'ㅚ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅢ'}
 _COMPOUND_JONG = {'ㄳ', 'ㄵ', 'ㄶ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅄ'}
 _VERTICAL_VOWELS = {'ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅣ'}
 _HORIZONTAL_VOWELS = {'ㅗ', 'ㅛ', 'ㅜ', 'ㅠ', 'ㅡ'}
-
-
-def visual_components(char: str) -> int:
-    if not ('가' <= char <= '힣'):
-        return 1
-    cho, jung, jong = decompose(char)
-    n = 1
-    n += 2 if jung in _COMPOUND_VOWELS else 1
-    if jong:
-        n += 2 if jong in _COMPOUND_JONG else 1
-    return n
 
 
 def syllable_type(char: str) -> int:
@@ -63,19 +54,48 @@ def char_tier(char: str) -> str:
     return "hard"
 
 
-_TIER_RANK = {"easy": 0, "medium": 1, "hard": 2}
+_TIER_POINT = {"easy": 1, "medium": 2, "hard": 3}
+
+def char_point(char: str) -> int:
+    """Difficulty point for a single character: easy=1, medium=2, hard=3, non-Hangul=0."""
+    tier = char_tier(char)
+    stype = syllable_type(char)
+    if stype == 0:
+        return 0
+    return _TIER_POINT[tier]
 
 
-def textbox_tier(text: str) -> str:
-    """Max tier across all characters determines textbox difficulty."""
-    max_rank = 0
+_DEDUP_SUFFIX = re.compile(r'_\d+$')
+
+def _strip_dedup_suffix(text: str) -> str:
+    """Remove duplicate-prevention suffix added by manifest builder ('간판_2' -> '간판')."""
+    return _DEDUP_SUFFIX.sub('', text)
+
+
+def textbox_difficulty(text: str) -> float:
+    """Log-length weighted average of char_point. Returns 0.0 if no Hangul."""
+    total = 0
+    count = 0
     for ch in text:
-        rank = _TIER_RANK.get(char_tier(ch), 0)
-        if rank > max_rank:
-            max_rank = rank
-        if max_rank == 2:
-            break
-    return ["easy", "medium", "hard"][max_rank]
+        pt = char_point(ch)
+        if pt > 0:
+            total += pt
+            count += 1
+    if count == 0:
+        return 0.0
+    return (total / count) * math.log2(1 + count)
+
+
+def image_difficulty(rec: dict) -> float:
+    """Sum of textbox_difficulty for all text boxes in an image record."""
+    texts = rec.get("text", [])
+    if isinstance(texts, str):
+        return textbox_difficulty(texts)
+    score = 0.0
+    for t in texts:
+        clean = _strip_dedup_suffix(t)
+        score += textbox_difficulty(clean)
+    return score
 
 
 def extract_type_jamo_tuples(text: str) -> list[tuple[int, str, str]]:
@@ -99,25 +119,45 @@ def build_type_jamo_freq(records: list[dict]) -> Counter:
     return freq
 
 
-def score_manifest(manifest_path: Path, out_path: Path):
-    """Score manifest and assign type-based tiers."""
-    records = list(json.loads(line) for line in open(manifest_path) if line.strip())
+def score_manifest_curriculum(manifest_path: Path, out_path: Path):
+    """Score images by rendering difficulty and split into curriculum tiers (terciles)."""
+    records = [json.loads(line) for line in open(manifest_path) if line.strip()]
+    print(f"  {len(records):,} images loaded")
+
+    scored = []
+    skipped = 0
+    for rec in records:
+        score = image_difficulty(rec)
+        if score == 0.0:
+            skipped += 1
+            continue
+        rec["curriculum"] = {"score": round(score, 4)}
+        scored.append((score, rec))
+
+    scored.sort(key=lambda x: x[0])
+    n = len(scored)
+    boundaries = [n // 3, 2 * n // 3]
+
+    for i, (score, rec) in enumerate(scored):
+        if i < boundaries[0]:
+            rec["curriculum"]["tier"] = "easy"
+        elif i < boundaries[1]:
+            rec["curriculum"]["tier"] = "medium"
+        else:
+            rec["curriculum"]["tier"] = "hard"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    counts = {"easy": 0, "medium": 0, "hard": 0}
-
+    counts = Counter(rec["curriculum"]["tier"] for _, rec in scored)
     with open(out_path, "w", encoding="utf-8") as f:
-        for rec in records:
-            text = rec.get("text", "")
-            tier = textbox_tier(text)
-            score = sum(visual_components(ch) for ch in text) if text else 0
-            counts[tier] += 1
-            rec["difficulty"] = {"score": score, "tier": tier}
+        for _, rec in scored:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    print(f"Saved difficulty scores -> {out_path}")
-    for t, c in counts.items():
-        print(f"  {t}={c:,}")
+    print(f"  Curriculum scored -> {out_path}")
+    print(f"  easy={counts['easy']:,}  medium={counts['medium']:,}  hard={counts['hard']:,}  skipped={skipped:,}")
+    easy_max = scored[boundaries[0] - 1][0] if boundaries[0] > 0 else 0
+    med_max = scored[boundaries[1] - 1][0] if boundaries[1] > 0 else 0
+    hard_max = scored[-1][0] if scored else 0
+    print(f"  Score ranges: easy≤{easy_max:.2f}  medium≤{med_max:.2f}  hard≤{hard_max:.2f}")
 
 
 if __name__ == "__main__":
@@ -126,4 +166,4 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    score_manifest(Path(args.manifest), Path(args.out))
+    score_manifest_curriculum(Path(args.manifest), Path(args.out))
