@@ -1,8 +1,5 @@
 """Convert label JSONs (COCO format) under [라벨]Training to flat manifest.jsonl.
-
 python dataset/manifest.py --category_filter "1.간판/1.가로형간판/가로형간판1"
-
-
 """
 
 from __future__ import annotations
@@ -38,7 +35,8 @@ def build_manifest(
     json_files = sorted(scan_root.rglob("*.json"))
     print(f"  {len(json_files):,} label files, {len(image_lookup):,} images")
 
-    records = []
+    # Group annotations by image (one record per image)
+    image_records: dict[str, dict] = {}
     skipped_no_image = 0
 
     for idx, json_path in enumerate(json_files):
@@ -56,29 +54,42 @@ def build_manifest(
             continue
 
         category = extract_category(json_path, label_root)
-        stem = json_path.stem
 
-        for i, ann in enumerate(data.get("annotations", [])):
+        for ann in data.get("annotations", []):
             text = ann.get("text", "")
-            if not text or text == "xxx":
+            if not text or text.strip().lower().replace("x", "") == "":
                 continue
 
-            records.append({
-                "annotation_id": f"{stem}_ann{i}",
-                "image_path": image_path,
-                "bbox": ann["bbox"],
-                "text": text,
-                "width": image_info.get("width"),
-                "height": image_info.get("height"),
-                "category": category,
-            })
+            if image_path not in image_records:
+                image_records[image_path] = {
+                    "image_path": image_path,
+                    "text": [],
+                    "bbox": {},
+                    "width": image_info.get("width"),
+                    "height": image_info.get("height"),
+                    "category": category,
+                }
+
+            rec = image_records[image_path]
+            # Handle duplicate text in same image by appending suffix
+            key = text
+            if key in rec["bbox"]:
+                i = 2
+                while f"{text}_{i}" in rec["bbox"]:
+                    i += 1
+                key = f"{text}_{i}"
+            rec["text"].append(key)
+            rec["bbox"][key] = ann["bbox"]
+
+    records = list(image_records.values())
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    print(f"  {len(records):,} annotations, {skipped_no_image:,} skipped (no image) -> {output_path}")
+    total_texts = sum(len(r["text"]) for r in records)
+    print(f"  {len(records):,} images, {total_texts:,} text annotations, {skipped_no_image:,} skipped (no image) -> {output_path}")
 
 
 if __name__ == "__main__":

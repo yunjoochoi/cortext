@@ -1,4 +1,4 @@
-"""Z-Image LoRA fine-tuning on manifest.jsonl (full image, no bbox masking).
+"""Z-Image LoRA fine-tuning on manifest.jsonl
 
 accelerate launch training/train_lora_z_image_simple.py \
     --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image \

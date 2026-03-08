@@ -18,8 +18,8 @@ Usage:
         --rank 8 --mixed_precision bf16 \
         --gradient_checkpointing --checkpointing_steps 1000
 
-manifest.jsonl format (one per line):
-    {"image_path": "/path/to/img.jpg", "text": "안식처", "width": 1600, "height": 1200, ...}
+manifest.jsonl format (one per line, one record per image):
+    {"image_path": "/path/to/img.jpg", "text": ["커피숖", "샛별"], "bbox": {"커피숖": [x,y,w,h], ...}, "width": 1600, "height": 1200, ...}
 """
 
 import argparse
@@ -77,7 +77,7 @@ def import_model_class_from_model_name_or_path(
 
 
 # ---------------------------------------------------------------------------
-# Korean Jamo definitions (Unicode Compatibility Jamo Block U+3130–U+318F)
+# Korean Jamo definitions 
 # ---------------------------------------------------------------------------
 # 14 basic consonants
 JAMO_CONSONANTS = list("ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎ")
@@ -87,7 +87,7 @@ JAMO_VOWELS = list("ㅏㅑㅓㅕㅗㅛㅜㅠㅡㅣ")
 JAMO_DOUBLE_CONSONANTS = list("ㄲㄸㅃㅆㅉ")
 # 11 compound vowels
 JAMO_COMPOUND_VOWELS = list("ㅐㅒㅔㅖㅘㅙㅚㅝㅞㅟㅢ")
-# 11 compound final consonants (겹받침)
+# 11 compound final consonants
 JAMO_COMPOUND_FINALS = list("ㄳㄵㄶㄺㄻㄼㄽㄾㄿㅀㅄ")
 
 EMPTY_TOKEN = "<EMPTY>"
@@ -206,10 +206,11 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def build_prompt(text: str, caption: str = "") -> str:
+def build_prompt(texts: list[str], caption: str = "") -> str:
+    joined = " ".join(texts)
     if caption:
-        return f"{caption}, with '{text}' written on it."
-    return f"A signage photo with '{text}' written on it."
+        return f"{caption}, with '{joined}' written on it."
+    return f"A signage photo with '{joined}' written on it."
 
 
 # bucket: 1024 × 768
@@ -257,12 +258,12 @@ class KoreanTextDataset(Dataset):
         image = crop(image, y1, x1, BUCKET_H, BUCKET_W)
         crop_top_left = (y1, x1)
 
-        text = rec["text"]
+        texts = rec["text"]  # list of strings
         caption = rec.get("caption", "")
         return {
             "pixel_values": self.to_tensor(image),
-            "text": text,
-            "prompt": build_prompt(text, caption),
+            "text": texts,
+            "prompt": build_prompt(texts, caption),
             "original_size": original_size,
             "crop_top_left": crop_top_left,
             "target_size": (BUCKET_H, BUCKET_W),
@@ -326,7 +327,7 @@ def main():
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    # ---- Add 52 Korean jamo special tokens to BOTH tokenizers & resize embeddings ----
+    # ---- Add 52 Korean jamo special tokens to BOTH tokenizers & resize embeddings table ----
     num_added_one = tokenizer_one.add_tokens(ALL_JAMO_TOKENS)
     num_added_two = tokenizer_two.add_tokens(ALL_JAMO_TOKENS)
     text_encoder_one.resize_token_embeddings(len(tokenizer_one))
@@ -463,16 +464,28 @@ def main():
     # Placeholder token — one <EMPTY> per Korean syllable in the prompt
     PLACEHOLDER = EMPTY_TOKEN  # "<EMPTY>"
 
-    def _build_placeholder_prompt(korean_text: str, max_chars: int) -> tuple:
+    def _build_placeholder_prompt(korean_texts: list[str], max_chars: int) -> tuple:
         """Build prompt with <EMPTY> placeholders for Korean chars.
 
+        Each text is decomposed into jamo, placeholders are joined by space.
         Returns (prompt_str, jamo_sequences).
         """
-        jamo_seqs = decompose_text_to_jamo_sequences(korean_text)
-        jamo_seqs = jamo_seqs[:max_chars]
-        placeholder_str = PLACEHOLDER * len(jamo_seqs)
+        all_jamo_seqs = []
+        placeholder_parts = []
+        remaining = max_chars
+        for text in korean_texts:
+            jamo_seqs = decompose_text_to_jamo_sequences(text)
+            jamo_seqs = jamo_seqs[:remaining]
+            if not jamo_seqs:
+                continue
+            all_jamo_seqs.extend(jamo_seqs)
+            placeholder_parts.append(PLACEHOLDER * len(jamo_seqs))
+            remaining -= len(jamo_seqs)
+            if remaining <= 0:
+                break
+        placeholder_str = " ".join(placeholder_parts)
         prompt = f"{PROMPT_PREFIX}{placeholder_str}{PROMPT_SUFFIX}"
-        return prompt, jamo_seqs
+        return prompt, all_jamo_seqs
 
     def encode_prompt_with_jamo(prompt_texts, korean_texts, max_jamo_chars):
         """SDXL dual-encoder prompt encoding with placeholder token replacement.
@@ -790,7 +803,7 @@ def main():
             pipeline = pipeline.to(accelerator.device)
             pipeline.set_progress_bar_config(disable=True)
             gen = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-            val_prompt = build_prompt(args.validation_prompt)
+            val_prompt = build_prompt([args.validation_prompt])
             images = [pipeline(val_prompt, generator=gen, num_inference_steps=30).images[0]
                       for _ in range(args.num_validation_images)]
             for tracker in accelerator.trackers:

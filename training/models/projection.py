@@ -8,6 +8,5 @@ class ImageProjector(nn.Module):
         self.projection = nn.Linear(latent_dim, embed_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, 1280, h, w] -> global avg pool -> [batch, 1280] -> project
         pooled = torch.mean(x, dim=[2, 3])
         return self.projection(pooled)

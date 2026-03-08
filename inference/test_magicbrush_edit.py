@@ -1,4 +1,4 @@
-"""Test MagicBrush (InstructPix2Pix) for bbox text editing vs Z-Image inpainting."""
+"""Test MagicBrush InstructPix2Pix for bbox text editing vs Z-Image inpainting."""
 
 import argparse
 from pathlib import Path

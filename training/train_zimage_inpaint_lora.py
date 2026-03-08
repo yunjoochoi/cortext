@@ -1,4 +1,4 @@
-"""Z-Image LoRA fine-tuning with 9-channel inpainting input (33ch latent: 16 noisy + 16 masked_image + 1 mask)."""
+"""Z-Image LoRA fine-tuning with inpainting input(9-channel, 33ch latent: 16 noisy + 16 masked_image + 1 mask)."""
 
 from __future__ import annotations
 

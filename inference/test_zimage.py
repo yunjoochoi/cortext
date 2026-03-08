@@ -3,9 +3,8 @@
 import torch
 from diffusers import ZImagePipeline
 
-MODEL_PATH = "/scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021"
 
-pipe = ZImagePipeline.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
+pipe = ZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
 prompt = (
