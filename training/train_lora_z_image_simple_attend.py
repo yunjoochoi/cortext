@@ -5,11 +5,11 @@ accelerate launch training/train_lora_z_image_simple.py \
     --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
     --output_dir /scratch2/shaush/training_output/lora_simple \
-    --height 1200 --width 1600 --center_crop \
+    --max_pixels 1048576 \
     --train_batch_size 1 --gradient_accumulation_steps 4 \
     --max_train_steps 5000 --learning_rate 1e-4 \
     --rank 32 --mixed_precision bf16 \
-    --gradient_checkpointing --cache_latents \
+    --gradient_checkpointing \
     --checkpointing_steps 500
 """
 
@@ -62,9 +62,8 @@ def parse_args():
     p.add_argument("--manifest", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="z-image-lora-simple")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--height", type=int, default=1200)
-    p.add_argument("--width", type=int, default=1600)
-    p.add_argument("--center_crop", action="store_true")
+    p.add_argument("--max_pixels", type=int, default=1024*1024,
+                   help="Max total pixels; images are scaled down to fit (aspect ratio preserved, 16-aligned)")
     p.add_argument("--train_batch_size", type=int, default=1)
     p.add_argument("--num_train_epochs", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=None)
@@ -114,25 +113,32 @@ def build_prompt(caption: str, texts: list) -> str:
 # Dataset: reads manifest.jsonl, builds prompt from caption + text
 # ---------------------------------------------------------------------------
 class ManifestDataset(Dataset):
-    def __init__(self, manifest_path: str, height: int, width: int, center_crop: bool = False):
+    ALIGN = 16  # must be divisible by vae_scale_factor(8) * patch_size(2)
+
+    def __init__(self, manifest_path: str, max_pixels: int = 1024 * 1024):
         self.records = []
         with open(manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
                 if rec.get("text"):
                     self.records.append(rec)
-        self.height = height
-        self.width = width
-        size = (height, width)
-        self.transform = transforms.Compose([
-            transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+        self.max_pixels = max_pixels
+        self.to_tensor = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
 
     def __len__(self):
         return len(self.records)
+
+    def _fit_size(self, w: int, h: int) -> tuple[int, int]:
+        """Scale down to fit max_pixels, then floor-align to ALIGN."""
+        if w * h > self.max_pixels:
+            scale = (self.max_pixels / (w * h)) ** 0.5
+            w, h = int(w * scale), int(h * scale)
+        w = w // self.ALIGN * self.ALIGN
+        h = h // self.ALIGN * self.ALIGN
+        return max(self.ALIGN, w), max(self.ALIGN, h)
 
     def __getitem__(self, idx):
         rec = self.records[idx]
@@ -141,18 +147,25 @@ class ManifestDataset(Dataset):
         orig_w, orig_h = image.size  # PIL: (w, h)
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        new_w, new_h = self._fit_size(orig_w, orig_h)
+        if (new_w, new_h) != (orig_w, orig_h):
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+
         texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
         bboxes = rec.get("bbox", {})
         return {
-            "pixel_values": self.transform(image),
+            "pixel_values": self.to_tensor(image),
             "prompt": build_prompt(rec.get("caption", ""), texts),
             "texts": texts,
             "bboxes": bboxes,
             "orig_size": (orig_w, orig_h),
+            "target_size": (new_w, new_h),
         }
 
 
 def collate_fn(examples):
+    # batch_size=1 assumed; variable resolution per sample
     pixel_values = torch.stack([e["pixel_values"] for e in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
     return {
@@ -161,6 +174,7 @@ def collate_fn(examples):
         "texts_list": [e["texts"] for e in examples],
         "bboxes_list": [e["bboxes"] for e in examples],
         "orig_sizes": [e["orig_size"] for e in examples],
+        "target_sizes": [e["target_size"] for e in examples],
     }
 
 
@@ -388,10 +402,9 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Validate resolution (must be divisible by vae_scale_factor * 2 = 16)
-    vae_align = 16
-    if args.height % vae_align != 0 or args.width % vae_align != 0:
-        raise ValueError(f"height ({args.height}) and width ({args.width}) must be divisible by {vae_align}")
+    vae_scale_factor = 8
+    patch_size = 2
+    latent_stride = vae_scale_factor * patch_size  # 16
 
     # ---- Load models ----
     tokenizer = Qwen2Tokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -445,7 +458,7 @@ def main():
         return prompt_embeds
 
     # ---- Dataset & DataLoader ----
-    train_dataset = ManifestDataset(args.manifest, args.height, args.width, args.center_crop)
+    train_dataset = ManifestDataset(args.manifest, args.max_pixels)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=args.dataloader_num_workers, drop_last=True,
@@ -494,18 +507,13 @@ def main():
     # ---- Char-loss setup ----
     use_char_loss = args.char_loss_lambda > 0
     char_loss_layers = [int(x) for x in args.char_loss_layers.split(",")] if use_char_loss else []
-    vae_scale_factor = 8
-    patch_size = 2
-    patch_h = args.height // (vae_scale_factor * patch_size)
-    patch_w = args.width // (vae_scale_factor * patch_size)
-    img_seq_len = patch_h * patch_w
 
     capture = None
     if use_char_loss:
         capture = LayerInputCapture()
         capture.register(unwrap(transformer), char_loss_layers)
         logger.info(f"Char-loss enabled: lambda={args.char_loss_lambda}, layers={char_loss_layers}, "
-                     f"patch_grid=({patch_h},{patch_w}), img_seq_len={img_seq_len}")
+                     f"latent_stride={latent_stride} (per-image variable resolution)")
 
     # ---- Pre-cache latents & prompt embeddings (after prepare, using prepared dataloader) ----
     latents_cache = []
@@ -520,9 +528,12 @@ def main():
                 latents_cache.append(vae.encode(pv).latent_dist)
                 prompt_embeds_cache.append(encode_prompts(batch["prompts"]))
             if use_char_loss:
+                target_w, target_h = batch["target_sizes"][0]
+                ph = target_h // latent_stride
+                pw = target_w // latent_stride
                 masks_cache.append(create_spatial_masks(
                     batch["bboxes_list"], batch["orig_sizes"],
-                    args.height, args.width, patch_h, patch_w, accelerator.device))
+                    target_h, target_w, ph, pw, accelerator.device))
                 token_indices_cache.append([
                     find_text_token_indices(tokenizer, p, t, args.max_sequence_length)
                     for p, t in zip(batch["prompts"], batch["texts_list"])
@@ -642,17 +653,22 @@ def main():
                     if args.cache_latents:
                         batch_masks = masks_cache[step % len(masks_cache)]
                         batch_tok_idx = token_indices_cache[step % len(token_indices_cache)]
+                        cur_img_seq_len = model_input.shape[-2] // patch_size * (model_input.shape[-1] // patch_size)
                     else:
+                        target_w, target_h = batch["target_sizes"][0]
+                        cur_patch_h = target_h // latent_stride
+                        cur_patch_w = target_w // latent_stride
+                        cur_img_seq_len = cur_patch_h * cur_patch_w
                         batch_masks = create_spatial_masks(
                             batch["bboxes_list"], batch["orig_sizes"],
-                            args.height, args.width, patch_h, patch_w, accelerator.device)
+                            target_h, target_w, cur_patch_h, cur_patch_w, accelerator.device)
                         batch_tok_idx = [
                             find_text_token_indices(tokenizer, p, t, args.max_sequence_length)
                             for p, t in zip(batch["prompts"], batch["texts_list"])
                         ]
                     char_loss = compute_char_loss(
                         capture, char_loss_layers, unwrap(transformer),
-                        img_seq_len, batch_masks, batch_tok_idx, accelerator.device)
+                        cur_img_seq_len, batch_masks, batch_tok_idx, accelerator.device)
 
                     # Debug: log char-loss details on first step
                     if global_step == 0 and accelerator.is_main_process:

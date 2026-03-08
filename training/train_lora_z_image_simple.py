@@ -4,11 +4,11 @@ accelerate launch training/train_lora_z_image_simple.py \
     --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
     --output_dir /scratch2/shaush/training_output/lora_simple \
-    --height 1200 --width 1600 --center_crop \
+    --max_pixels 1048576 \
     --train_batch_size 1 --gradient_accumulation_steps 4 \
     --max_train_steps 5000 --learning_rate 1e-4 \
     --rank 16 --mixed_precision bf16 \
-    --gradient_checkpointing --cache_latents \
+    --gradient_checkpointing \
     --checkpointing_steps 500
 """
 
@@ -60,9 +60,8 @@ def parse_args():
     p.add_argument("--manifest", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="z-image-lora-simple")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--height", type=int, default=1200)
-    p.add_argument("--width", type=int, default=1600)
-    p.add_argument("--center_crop", action="store_true")
+    p.add_argument("--max_pixels", type=int, default=1024*1024,
+                   help="Max total pixels; images are scaled down to fit (aspect ratio preserved, 16-aligned)")
     p.add_argument("--train_batch_size", type=int, default=1)
     p.add_argument("--num_train_epochs", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=None)
@@ -107,17 +106,17 @@ def build_prompt(caption: str, text: str) -> str:
 # Dataset: reads manifest.jsonl, builds prompt from caption + text
 # ---------------------------------------------------------------------------
 class ManifestDataset(Dataset):
-    def __init__(self, manifest_path: str, height: int, width: int, center_crop: bool = False):
+    ALIGN = 16  # must be divisible by vae_scale_factor(8) * patch_size(2)
+
+    def __init__(self, manifest_path: str, max_pixels: int = 1024 * 1024):
         self.records = []
         with open(manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
                 if rec.get("text"):
                     self.records.append(rec)
-        size = (height, width)
-        self.transform = transforms.Compose([
-            transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+        self.max_pixels = max_pixels
+        self.to_tensor = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
@@ -125,14 +124,29 @@ class ManifestDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
+    def _fit_size(self, w: int, h: int) -> tuple[int, int]:
+        """Scale down to fit max_pixels, then floor-align to ALIGN."""
+        if w * h > self.max_pixels:
+            scale = (self.max_pixels / (w * h)) ** 0.5
+            w, h = int(w * scale), int(h * scale)
+        w = w // self.ALIGN * self.ALIGN
+        h = h // self.ALIGN * self.ALIGN
+        return max(self.ALIGN, w), max(self.ALIGN, h)
+
     def __getitem__(self, idx):
         rec = self.records[idx]
         image = Image.open(rec["image_path"])
         image = exif_transpose(image)
+        orig_w, orig_h = image.size
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        new_w, new_h = self._fit_size(orig_w, orig_h)
+        if (new_w, new_h) != (orig_w, orig_h):
+            image = image.resize((new_w, new_h), Image.BILINEAR)
+
         return {
-            "pixel_values": self.transform(image),
+            "pixel_values": self.to_tensor(image),
             "prompt": build_prompt(rec.get("caption", ""), rec["text"]),
         }
 
@@ -170,10 +184,7 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Validate resolution (must be divisible by vae_scale_factor * 2 = 16)
-    vae_align = 16
-    if args.height % vae_align != 0 or args.width % vae_align != 0:
-        raise ValueError(f"height ({args.height}) and width ({args.width}) must be divisible by {vae_align}")
+    # Resolution is handled per-image in ManifestDataset (max_pixels + 16-align)
 
     # ---- Load models ----
     tokenizer = Qwen2Tokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -227,7 +238,7 @@ def main():
         return prompt_embeds
 
     # ---- Dataset & DataLoader ----
-    train_dataset = ManifestDataset(args.manifest, args.height, args.width, args.center_crop)
+    train_dataset = ManifestDataset(args.manifest, args.max_pixels)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=args.dataloader_num_workers, drop_last=True,
