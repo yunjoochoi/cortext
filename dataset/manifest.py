@@ -57,7 +57,12 @@ def build_manifest(
 
         for ann in data.get("annotations", []):
             text = ann.get("text", "")
-            if not text or text.strip().lower().replace("x", "") == "":
+            if not text:
+                continue
+            t = text.strip()
+            if "x" in t.lower():
+                continue
+            if all(0x3131 <= ord(c) <= 0x318E for c in t):
                 continue
 
             if image_path not in image_records:
