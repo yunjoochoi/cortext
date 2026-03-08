@@ -1,5 +1,5 @@
 """Z-Image LoRA fine-tuning on manifest.jsonl
-L_mse(전체) + λ * L_char(글자 위치)
+L_mse(전체) + λ₁ * L_char(글자 위치) + λ₂ * L_contrastive(glyph discriminability)
 
 accelerate launch training/train_lora_z_image_simple.py \
     --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image \
@@ -19,7 +19,9 @@ import json
 import logging
 import math
 import os
+import random
 import shutil
+import sys
 from pathlib import Path
 
 import torch
@@ -30,6 +32,7 @@ from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
+from PIL import ImageDraw, ImageFont
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -52,6 +55,12 @@ from diffusers.training_utils import (
 from diffusers.utils import convert_unet_state_dict_to_peft
 from diffusers.utils.torch_utils import is_compiled_module
 from transformers import Qwen2Tokenizer, Qwen3Model
+
+# Hard-negative generation for contrastive loss
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from core.jamo import substitute_one_jamo
 
 logger = get_logger(__name__)
 
@@ -100,6 +109,17 @@ def parse_args():
                    help="Weight for character localization loss (0 to disable)")
     p.add_argument("--char_loss_layers", type=str, default="12,13,14,15,16",
                    help="Comma-separated transformer layer indices for char localization loss")
+    # Contrastive glyph discriminability loss
+    p.add_argument("--contrastive_lambda", type=float, default=0.0,
+                   help="Weight for contrastive glyph discriminability loss (0 to disable)")
+    p.add_argument("--contrastive_layers", type=str, default="14,15,16",
+                   help="Comma-separated transformer layer indices for contrastive loss")
+    p.add_argument("--contrastive_temperature", type=float, default=0.07,
+                   help="Temperature for InfoNCE contrastive loss")
+    p.add_argument("--font_path", type=str, default=None,
+                   help="Path to Korean TTF font for synthetic text rendering")
+    p.add_argument("--synthetic_size", type=int, default=512,
+                   help="Resolution for synthetic rendered text images (must be divisible by 16)")
     return p.parse_args()
 
 
@@ -232,6 +252,76 @@ def find_text_token_indices(tokenizer, prompt, texts, max_length):
             if char_indices:
                 result[text] = char_indices
     return result
+
+
+def generate_hard_negative(text: str) -> str | None:
+    """Generate a 1-jamo confusable variant of Korean text on-the-fly."""
+    candidates = substitute_one_jamo(text)
+    if not candidates:
+        return None
+    return random.choice(candidates)[0]
+
+
+def render_text_image(
+    text: str, height: int, width: int,
+    font_path: str | None = None, font_size: int | None = None,
+) -> Image.Image:
+    """Render black text centered on a white background."""
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    fs = font_size or max(height // 3, 48)
+    if font_path:
+        font = ImageFont.truetype(font_path, fs)
+    else:
+        font = ImageFont.load_default(size=fs)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x, y = (width - tw) // 2, (height - th) // 2
+    draw.text((x, y), text, fill="black", font=font)
+    return img
+
+
+def compute_contrastive_loss(
+    capture: "LayerInputCapture",
+    layer_indices: list[int],
+    synth_img_seq_len: int,
+    temperature: float = 0.07,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """InfoNCE contrastive loss on DiT hidden states.
+
+    Expects capture to hold states from a batch-2 forward where
+    batch[0] = positive (correct text) rendering,
+    batch[1] = negative (confusable text) rendering,
+    both conditioned on the same text prompt.
+
+    For each layer: pool image-token hidden states and text-token hidden states,
+    then push sim(pos_img, txt) > sim(neg_img, txt) via cross-entropy.
+    """
+    total_loss = torch.tensor(0.0, device=device)
+    n_terms = 0
+    for layer_idx in layer_indices:
+        x = capture.stored.get(f"x_{layer_idx}")
+        if x is None or x.shape[0] < 2:
+            continue
+        # image tokens → spatial mean pool
+        pos_img_h = x[0, :synth_img_seq_len].mean(dim=0)
+        neg_img_h = x[1, :synth_img_seq_len].mean(dim=0)
+        # text tokens → mean pool (same prompt for both, use batch 0)
+        txt_h = x[0, synth_img_seq_len:].mean(dim=0)
+
+        pos_img_h = F.normalize(pos_img_h, dim=-1)
+        neg_img_h = F.normalize(neg_img_h, dim=-1)
+        txt_h = F.normalize(txt_h, dim=-1)
+
+        pos_sim = torch.dot(pos_img_h, txt_h)
+        neg_sim = torch.dot(neg_img_h, txt_h)
+        logits = torch.stack([pos_sim, neg_sim]).unsqueeze(0) / temperature
+        labels = torch.zeros(1, dtype=torch.long, device=device)
+        total_loss = total_loss + F.cross_entropy(logits, labels)
+        n_terms += 1
+
+    return total_loss / max(n_terms, 1)
 
 
 class LayerInputCapture:
@@ -500,10 +590,33 @@ def main():
     patch_w = args.width // (vae_scale_factor * patch_size)
     img_seq_len = patch_h * patch_w
 
+    # ---- Contrastive loss setup ----
+    use_contrastive = args.contrastive_lambda > 0
+    contrastive_layers = [int(x) for x in args.contrastive_layers.split(",")] if use_contrastive else []
+    synth_img_seq_len = 0
+    synthetic_transform = None
+    if use_contrastive:
+        if not args.font_path:
+            raise ValueError("--font_path is required when --contrastive_lambda > 0 (default font cannot render Korean)")
+        if args.synthetic_size % 16 != 0:
+            raise ValueError(f"synthetic_size ({args.synthetic_size}) must be divisible by 16")
+        synth_patch = args.synthetic_size // (vae_scale_factor * patch_size)
+        synth_img_seq_len = synth_patch * synth_patch
+        synthetic_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        logger.info(f"Contrastive loss enabled: lambda={args.contrastive_lambda}, "
+                     f"layers={contrastive_layers}, temperature={args.contrastive_temperature}, "
+                     f"synth_size={args.synthetic_size}, synth_img_seq={synth_img_seq_len}")
+
+    # ---- Hook registration (union of char-loss + contrastive layers) ----
     capture = None
-    if use_char_loss:
+    all_capture_layers = sorted(set(char_loss_layers + contrastive_layers))
+    if all_capture_layers:
         capture = LayerInputCapture()
-        capture.register(unwrap(transformer), char_loss_layers)
+        capture.register(unwrap(transformer), all_capture_layers)
+    if use_char_loss:
         logger.info(f"Char-loss enabled: lambda={args.char_loss_lambda}, layers={char_loss_layers}, "
                      f"patch_grid=({patch_h},{patch_w}), img_seq_len={img_seq_len}")
 
@@ -621,7 +734,7 @@ def main():
                 noisy_list = list(noisy_model_input.unsqueeze(2).unbind(dim=0))
 
                 # Clear captured states before forward
-                if use_char_loss:
+                if capture is not None:
                     capture.clear()
 
                 model_pred_list = transformer(
@@ -661,7 +774,67 @@ def main():
                         logger.info(f"[char-loss debug] masks={n_masks}, token_matches={n_matched}, "
                                      f"char_loss={char_loss.item():.6f}")
 
-                loss = loss_mse + args.char_loss_lambda * char_loss
+                # Contrastive glyph discriminability loss
+                contrastive_loss = torch.tensor(0.0, device=accelerator.device)
+                if use_contrastive:
+                    # Pick one text randomly from the batch
+                    b_idx = random.randint(0, bsz - 1)
+                    if args.cache_latents:
+                        texts_b = texts_cache[step % len(texts_cache)][b_idx]
+                    else:
+                        texts_b = batch["texts_list"][b_idx]
+                    anchor = random.choice(texts_b)
+                    neg_text = generate_hard_negative(anchor)
+
+                    if neg_text is None and global_step == 0 and accelerator.is_main_process:
+                        logger.warning(f"[contrastive] No confusable variant for '{anchor}', skipping")
+
+                    if neg_text is not None:
+                        # Render positive (GT text) and negative (confusable) images
+                        pos_img = render_text_image(
+                            anchor, args.synthetic_size, args.synthetic_size, args.font_path)
+                        neg_img = render_text_image(
+                            neg_text, args.synthetic_size, args.synthetic_size, args.font_path)
+
+                        synth_pv = torch.stack([
+                            synthetic_transform(pos_img),
+                            synthetic_transform(neg_img),
+                        ]).to(accelerator.device, dtype=weight_dtype)
+
+                        # VAE encode synthetic images
+                        with torch.no_grad():
+                            synth_latents = vae.encode(synth_pv).latent_dist.mode()
+                        synth_latents = (synth_latents - vae_shift) * vae_scale
+
+                        # Add noise at the same sigma as the main sample
+                        synth_noise = torch.randn_like(synth_latents)
+                        sigma_s = sigmas[b_idx].unsqueeze(0).expand(2, -1, -1, -1)
+                        synth_noisy = (1.0 - sigma_s) * synth_latents + sigma_s * synth_noise
+
+                        with torch.no_grad():
+                            synth_embed = encode_prompts([f"The text '{anchor}'"])[0]
+                        synth_prompt = [synth_embed, synth_embed]
+                        synth_ts = timestep_normalized[b_idx:b_idx + 1].expand(2)
+                        synth_noisy_list = list(synth_noisy.unsqueeze(2).unbind(dim=0))
+
+                        # Forward synthetic images through DiT
+                        capture.clear()
+                        _ = transformer(
+                            synth_noisy_list, synth_ts, synth_prompt, return_dict=False)
+
+                        contrastive_loss = compute_contrastive_loss(
+                            capture, contrastive_layers, synth_img_seq_len,
+                            args.contrastive_temperature, accelerator.device)
+
+                        # Debug: log on first step
+                        if global_step == 0 and accelerator.is_main_process:
+                            logger.info(
+                                f"[contrastive debug] anchor='{anchor}', neg='{neg_text}', "
+                                f"loss={contrastive_loss.item():.6f}")
+
+                loss = (loss_mse
+                        + args.char_loss_lambda * char_loss
+                        + args.contrastive_lambda * contrastive_loss)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -688,6 +861,7 @@ def main():
                 "loss": loss.detach().item(),
                 "loss_mse": loss_mse.detach().item(),
                 "loss_char": char_loss.detach().item() if use_char_loss else 0.0,
+                "loss_contrastive": contrastive_loss.detach().item() if use_contrastive else 0.0,
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)
