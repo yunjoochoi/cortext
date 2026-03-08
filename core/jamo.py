@@ -8,18 +8,27 @@ _CHO_IDX = {c: i for i, c in enumerate(CHOSUNG)}
 _JUNG_IDX = {c: i for i, c in enumerate(JUNGSUNG)}
 _JONG_IDX = {c: i for i, c in enumerate(JONGSUNG)}
 
-_SIMPLE_JONG = {'ㄱ','ㄲ','ㄴ','ㄷ','ㄹ','ㅁ','ㅂ','ㅅ','ㅆ','ㅇ','ㅈ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ'}
-
 # Visually confusable jamo pairs (used as filter, not weighted)
 CONFUSABLE_PAIRS: list[tuple[str, str]] = [
+    # Simple vowels
     ('ㅓ', 'ㅔ'), ('ㅔ', 'ㅐ'), ('ㅓ', 'ㅐ'),
     ('ㅓ', 'ㅕ'), ('ㅗ', 'ㅛ'), ('ㅜ', 'ㅠ'),
-    ('ㅏ', 'ㅑ'),
-    ('ㅡ', 'ㅣ'),
+    ('ㅏ', 'ㅑ'), ('ㅐ', 'ㅒ'), ('ㅔ', 'ㅖ'),
+    # Compound vowels
+    ('ㅘ', 'ㅙ'), ('ㅙ', 'ㅚ'), ('ㅘ', 'ㅚ'),
+    ('ㅝ', 'ㅞ'), ('ㅞ', 'ㅟ'), ('ㅝ', 'ㅟ'),
+    ('ㅢ', 'ㅟ'),
+    # Simple consonants
     ('ㅁ', 'ㅇ'), ('ㅁ', 'ㅂ'),
     ('ㅂ', 'ㅍ'), ('ㅈ', 'ㅊ'), ('ㄴ', 'ㄷ'),
     ('ㄷ', 'ㅌ'), ('ㄱ', 'ㅋ'),
-    ('ㄴ', 'ㄹ'), ('ㄴ', 'ㄷ'),
+    ('ㄴ', 'ㄹ'),
+    # Fortis (single/double)
+    ('ㄱ', 'ㄲ'), ('ㄷ', 'ㄸ'), ('ㅂ', 'ㅃ'), ('ㅅ', 'ㅆ'), ('ㅈ', 'ㅉ'),
+    # Compound jongsung
+    ('ㄺ', 'ㄻ'), ('ㄻ', 'ㄼ'),
+    ('ㄾ', 'ㄿ'), ('ㄿ', 'ㅀ'),
+    ('ㄳ', 'ㄵ'), ('ㅄ', 'ㄳ'),
 ]
 
 JAMO_CONFUSABLE: dict[str, list[str]] = {}
@@ -59,9 +68,9 @@ def substitute_one_jamo(word: str) -> list[tuple[str, int, str, str]]:
                 new_word = word[:syl_i] + compose(cho, alt, jong) + word[syl_i + 1:]
                 results.append((new_word, syl_i, jung, alt))
 
-        if jong and jong in _SIMPLE_JONG:
+        if jong:
             for alt in JAMO_CONFUSABLE.get(jong, []):
-                if alt in _JONG_IDX and alt in _SIMPLE_JONG:
+                if alt in _JONG_IDX:
                     new_word = word[:syl_i] + compose(cho, jung, alt) + word[syl_i + 1:]
                     results.append((new_word, syl_i, jong, alt))
 

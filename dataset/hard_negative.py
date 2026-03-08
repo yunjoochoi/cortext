@@ -10,7 +10,8 @@ from core.jamo import decompose, substitute_one_jamo
 from core.utils import read_jsonl, write_jsonl
 from core.difficulty import syllable_type, build_type_jamo_freq
 
-NEG_COVERAGE_CAP = 500
+# saturation criteria for negative tuple.
+NEG_COVERAGE_CAP = 500 
 
 
 def _coverage_score(
