@@ -1,15 +1,19 @@
 """Z-Image LoRA fine-tuning on manifest.jsonl
 
-accelerate launch training/train_lora_z_image_simple.py \
-    --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image \
+accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
+    --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
     --output_dir /scratch2/shaush/training_output/lora_simple \
     --max_pixels 1048576 \
-    --train_batch_size 1 --gradient_accumulation_steps 4 \
-    --max_train_steps 5000 --learning_rate 1e-4 \
-    --rank 16 --mixed_precision bf16 \
+    --train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --max_train_steps 5000 \
+    --learning_rate 1e-4 \
+    --rank 16 \
+    --mixed_precision bf16 \
     --gradient_checkpointing \
     --checkpointing_steps 500
+    
 """
 
 import argparse
@@ -96,10 +100,11 @@ def parse_args():
     return p.parse_args()
 
 
-def build_prompt(caption: str, text: str) -> str:
+def build_prompt(caption: str, texts: list) -> str:
+    text_str = ", ".join(texts)
     if caption:
-        return f"{caption}, with '{text}' written on it."
-    return f"A Korean signage photo with '{text}' written on it."
+        return f"{caption}, texts are written on it: {text_str}"
+    return f"A signage photo, texts are written on it: {text_str}"
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +150,10 @@ class ManifestDataset(Dataset):
         if (new_w, new_h) != (orig_w, orig_h):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
+        texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
         return {
             "pixel_values": self.to_tensor(image),
-            "prompt": build_prompt(rec.get("caption", ""), rec["text"]),
+            "prompt": build_prompt(rec.get("caption", ""), texts),
         }
 
 
@@ -228,7 +234,7 @@ def main():
     )
 
     def encode_prompts(prompts):
-        """Encode prompts → List[Tensor[seq_len, hidden_dim]] (no CFG)."""
+        """Encode prompts -> List[Tensor[seq_len, hidden_dim]] (no CFG)."""
         with torch.no_grad():
             prompt_embeds, _ = text_encoding_pipeline.encode_prompt(
                 prompt=prompts,
@@ -244,10 +250,6 @@ def main():
         collate_fn=collate_fn, num_workers=args.dataloader_num_workers, drop_last=True,
     )
     logger.info(f"Dataset: {len(train_dataset):,} samples")
-
-    # ---- Pre-cache latents & prompt embeddings ----
-    # Caching must happen AFTER accelerator.prepare() to match dataloader order on multi-GPU.
-    # We defer it to after prepare below.
 
     # ---- Optimizer ----
     trainable_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
@@ -304,7 +306,9 @@ def main():
     def save_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             lora_layers = get_peft_model_state_dict(unwrap(transformer))
+            print("lora_layers: ", lora_layers)
             if weights:
+                print("weights: ", weights[:100])
                 weights.pop()
             ZImagePipeline.save_lora_weights(
                 output_dir, transformer_lora_layers=lora_layers,

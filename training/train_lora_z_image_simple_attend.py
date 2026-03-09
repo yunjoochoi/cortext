@@ -103,10 +103,10 @@ def parse_args():
 
 
 def build_prompt(caption: str, texts: list) -> str:
-    text_str = " and ".join(f"'{t}'" for t in texts)
+    text_str = ", ".join(texts)
     if caption:
-        return f"{caption}, with {text_str} written on it."
-    return f"A Korean signage photo with {text_str} written on it."
+        return f"{caption}, texts are written on it: {text_str}"
+    return f"A signage photo, texts are written on it: {text_str}"
 
 
 # ---------------------------------------------------------------------------
