@@ -18,9 +18,9 @@ accelerate launch --num_processes 2 training/train_lora_z_image_simple_attend.py
     --gradient_accumulation_steps 8 \
     --max_train_steps 5000 \
     --learning_rate 1e-4 \
-    --rank 32 \
+    --rank 16 \
     --mixed_precision bf16 \
     --gradient_checkpointing \
     --checkpointing_steps 500 \
-    --char_loss_lambda 0.01 \
+    --char_loss_lambda 0.05 \
     --char_loss_layers 12,13,14,15,16

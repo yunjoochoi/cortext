@@ -95,7 +95,7 @@ def parse_args():
     p.add_argument("--num_validation_images", type=int, default=4)
     p.add_argument("--cache_latents", action="store_true")
     p.add_argument("--use_8bit_adam", action="store_true")
-    p.add_argument("--char_loss_lambda", type=float, default=0.01,
+    p.add_argument("--char_loss_lambda", type=float, default=0.05,
                    help="Weight for character localization loss (0 to disable)")
     p.add_argument("--char_loss_layers", type=str, default="12,13,14,15,16",
                    help="Comma-separated transformer layer indices for char localization loss")
@@ -354,15 +354,17 @@ def compute_char_loss(
             if not tok_map:
                 continue
 
-            # image queries / text keys  (average over heads for memory)
-            q_img = q[b, :img_seq_len].mean(dim=1)       # (img_seq, head_dim)
-            k_txt = k[b, img_seq_len:].mean(dim=1)       # (txt_seq, head_dim)
+            # image queries / text keys — per-head attention, then average
+            q_img = q[b, :img_seq_len]                    # (img_seq, n_heads, head_dim)
+            k_txt = k[b, img_seq_len:]                    # (txt_seq, n_heads, head_dim)
             if k_txt.shape[0] == 0:
                 continue
 
-            # cross-attention map: softmax over text tokens
-            logits = torch.matmul(q_img, k_txt.t()) / (head_dim ** 0.5)
-            attn_map = F.softmax(logits, dim=-1)          # (img_seq, txt_seq)
+            # (n_heads, img_seq, head_dim) @ (n_heads, head_dim, txt_seq) → (n_heads, img_seq, txt_seq)
+            q_h = q_img.permute(1, 0, 2)
+            k_h = k_txt.permute(1, 2, 0)
+            logits = torch.bmm(q_h, k_h) / (head_dim ** 0.5)
+            attn_map = F.softmax(logits, dim=-1).mean(dim=0)  # (img_seq, txt_seq)
 
             for text, tok_indices in tok_map.items():
                 if text not in masks:
