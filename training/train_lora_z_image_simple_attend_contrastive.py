@@ -238,15 +238,22 @@ def find_text_token_indices(tokenizer, prompt, texts, max_length):
     """
     full_ids = tokenizer.encode(prompt, max_length=max_length, truncation=True)
     result = {}
-    for text in texts:
+    used_positions: set[int] = set()
+    # Sort by length descending to prevent substring overlap
+    # e.g. "보광약국" matched before "보광"
+    for text in sorted(texts, key=len, reverse=True):
         text_ids = tokenizer.encode(text, add_special_tokens=False)
         if not text_ids:
             continue
         n = len(text_ids)
         found = False
         for i in range(len(full_ids) - n + 1):
+            positions = set(range(i, i + n))
+            if positions & used_positions:
+                continue
             if full_ids[i:i + n] == text_ids:
                 result[text] = list(range(i, i + n))
+                used_positions.update(positions)
                 found = True
                 break
         if not found:
@@ -259,12 +266,16 @@ def find_text_token_indices(tokenizer, prompt, texts, max_length):
                     continue
                 m = len(ch_ids)
                 for j in range(search_start, len(full_ids) - m + 1):
+                    positions = set(range(j, j + m))
+                    if positions & used_positions:
+                        continue
                     if full_ids[j:j + m] == ch_ids:
                         char_indices.extend(range(j, j + m))
                         search_start = j + m
                         break
             if char_indices:
                 result[text] = char_indices
+                used_positions.update(char_indices)
     return result
 
 
