@@ -288,21 +288,33 @@ def generate_hard_negative(text: str) -> str | None:
 
 
 def render_text_image(
-    text: str, height: int, width: int,
-    font_path: str | None = None, font_size: int | None = None,
+    text: str, base_height: int,
+    font_path: str | None = None,
+    align: int = 16, padding: int = 64,
 ) -> Image.Image:
-    """Render black text centered on a white background."""
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    fs = font_size or max(height // 3, 48)
+    """Render bold black text on white, sized to fit the text content."""
+    fs = max(base_height // 3, 48)
     if font_path:
         font = ImageFont.truetype(font_path, fs)
     else:
         font = ImageFont.load_default(size=fs)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x, y = (width - tw) // 2, (height - th) // 2
+    # measure actual text bounding box (includes ascender/descender offsets)
+    tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    x0, y0, x1, y1 = tmp.textbbox((0, 0), text, font=font)
+    tw, th = x1 - x0, y1 - y0
+    # image size: fit text + padding, align to 16px
+    w = (tw + padding * 2 + align - 1) // align * align
+    h = (th + padding * 2 + align - 1) // align * align
+    w, h = max(align, w), max(align, h)
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    # center text accounting for bbox offset
+    x = (w - tw) // 2 - x0
+    y = (h - th) // 2 - y0
+    # draw twice with slight offset for bold effect
     draw.text((x, y), text, fill="black", font=font)
+    draw.text((x + 1, y), text, fill="black", font=font)
+    draw.text((x, y + 1), text, fill="black", font=font)
     return img
 
 
@@ -335,12 +347,12 @@ def compute_contrastive_loss(
         # text tokens → mean pool (same prompt for both, use batch 0)
         txt_h = x[0, synth_img_seq_len:].mean(dim=0)
 
-        pos_img_h = F.normalize(pos_img_h, dim=-1)
-        neg_img_h = F.normalize(neg_img_h, dim=-1)
-        txt_h = F.normalize(txt_h, dim=-1)
+        pos_img_h = F.normalize(pos_img_h.float(), dim=-1)
+        neg_img_h = F.normalize(neg_img_h.float(), dim=-1)
+        txt_h = F.normalize(txt_h.float(), dim=-1)
 
-        pos_sim = torch.dot(pos_img_h, txt_h)
-        neg_sim = torch.dot(neg_img_h, txt_h)
+        pos_sim = (pos_img_h * txt_h).sum()
+        neg_sim = (neg_img_h * txt_h).sum()
         logits = torch.stack([pos_sim, neg_sim]).unsqueeze(0) / temperature
         labels = torch.zeros(1, dtype=torch.long, device=device)
         total_loss = total_loss + F.cross_entropy(logits, labels)
@@ -366,11 +378,11 @@ def log_layer_similarity_gaps(
         if x is None or x.shape[0] < 2:
             continue
         with torch.no_grad():
-            pos_img_h = F.normalize(x[0, :synth_img_seq_len].mean(dim=0), dim=-1)
-            neg_img_h = F.normalize(x[1, :synth_img_seq_len].mean(dim=0), dim=-1)
-            txt_h = F.normalize(x[0, synth_img_seq_len:].mean(dim=0), dim=-1)
-            pos_sim = torch.dot(pos_img_h, txt_h).item()
-            neg_sim = torch.dot(neg_img_h, txt_h).item()
+            pos_img_h = F.normalize(x[0, :synth_img_seq_len].mean(dim=0).float(), dim=-1)
+            neg_img_h = F.normalize(x[1, :synth_img_seq_len].mean(dim=0).float(), dim=-1)
+            txt_h = F.normalize(x[0, synth_img_seq_len:].mean(dim=0).float(), dim=-1)
+            pos_sim = (pos_img_h * txt_h).sum().item()
+            neg_sim = (neg_img_h * txt_h).sum().item()
             gaps[layer_idx] = (pos_sim - neg_sim, pos_sim, neg_sim)
 
     gap_str = " | ".join(
@@ -643,22 +655,17 @@ def main():
     # ---- Contrastive loss setup ----
     use_contrastive = args.contrastive_lambda > 0
     contrastive_layers = [int(x) for x in args.contrastive_layers.split(",")] if use_contrastive else []
-    synth_img_seq_len = 0
     synthetic_transform = None
     if use_contrastive:
         if not args.font_path:
             raise ValueError("--font_path is required when --contrastive_lambda > 0 (default font cannot render Korean)")
-        if args.synthetic_size % 16 != 0:
-            raise ValueError(f"synthetic_size ({args.synthetic_size}) must be divisible by 16")
-        synth_patch = args.synthetic_size // latent_stride
-        synth_img_seq_len = synth_patch * synth_patch  # fixed size for synthetic images
         synthetic_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
         logger.info(f"Contrastive loss enabled: lambda={args.contrastive_lambda}, "
                      f"layers={contrastive_layers}, temperature={args.contrastive_temperature}, "
-                     f"synth_size={args.synthetic_size}, synth_img_seq={synth_img_seq_len}")
+                     f"synth_base_height={args.synthetic_size} (width adapts to text length)")
 
     # ---- Hook registration (union of char-loss + contrastive layers) ----
     capture = None
@@ -850,9 +857,16 @@ def main():
                     if neg_text is not None:
                         # Render positive (GT text) and negative (confusable) images
                         pos_img = render_text_image(
-                            anchor, args.synthetic_size, args.synthetic_size, args.font_path)
+                            anchor, args.synthetic_size, args.font_path)
                         neg_img = render_text_image(
-                            neg_text, args.synthetic_size, args.synthetic_size, args.font_path)
+                            neg_text, args.synthetic_size, args.font_path)
+                        # Resize neg to match pos (same char count → similar size, but ensure stack works)
+                        if neg_img.size != pos_img.size:
+                            neg_img = neg_img.resize(pos_img.size, Image.BILINEAR)
+
+                        # Compute dynamic synth_img_seq_len from rendered size
+                        pw, ph = pos_img.size  # PIL (w, h)
+                        cur_synth_img_seq_len = (ph // latent_stride) * (pw // latent_stride)
 
                         synth_pv = torch.stack([
                             synthetic_transform(pos_img),
@@ -889,7 +903,7 @@ def main():
                             synth_noisy_list, synth_ts, synth_prompt, return_dict=False)
 
                         contrastive_loss = compute_contrastive_loss(
-                            capture, contrastive_layers, synth_img_seq_len,
+                            capture, contrastive_layers, cur_synth_img_seq_len,
                             args.contrastive_temperature, accelerator.device)
 
                         # Log layer-wise similarity gaps then clean up
@@ -900,7 +914,7 @@ def main():
                             all_layer_indices = sorted(
                                 set([i for i in range(0, 30, 2)] + contrastive_layers))
                             log_layer_similarity_gaps(
-                                combined, all_layer_indices, synth_img_seq_len, global_step)
+                                combined, all_layer_indices, cur_synth_img_seq_len, global_step)
                             diag_capture.remove()
 
                         # Debug: save synthetic images & log on first few steps
