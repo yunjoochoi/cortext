@@ -21,4 +21,5 @@ accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
     --rank 16 \
     --mixed_precision bf16 \
     --gradient_checkpointing \
-    --checkpointing_steps 500
+    --checkpointing_steps 500 \
+    --resume_from_checkpoint /scratch2/shaush/training_output/lora_simple/checkpoint-3500

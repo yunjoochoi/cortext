@@ -311,10 +311,8 @@ def render_text_image(
     # center text accounting for bbox offset
     x = (w - tw) // 2 - x0
     y = (h - th) // 2 - y0
-    # draw twice with slight offset for bold effect
-    draw.text((x, y), text, fill="black", font=font)
-    draw.text((x + 1, y), text, fill="black", font=font)
-    draw.text((x, y + 1), text, fill="black", font=font)
+    sw = max(fs // 15 - 1, 1)
+    draw.text((x, y), text, fill="black", font=font, stroke_width=sw, stroke_fill="black")
     return img
 
 

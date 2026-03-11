@@ -16,8 +16,8 @@ from core.utils import read_jsonl, write_jsonl
 QWEN_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
 SYSTEM_PROMPT = (
-    "You are a concise image captioner. "
-    "Describe the image in one short English sentence focusing on the scene, signage type, and surroundings. "
+    "You are a image captioner. "
+    "Describe the image in one English sentence focusing on the scene, signage type, and surroundings. "
     "Do NOT mention or transcribe any specific text, letters, words, or characters visible in the image. "
     "Do NOT read the signs. Only describe the visual scene."
 )
@@ -109,9 +109,9 @@ def generate_captions(
             img = Image.open(rec["image_path"]).convert("RGB")
             img.thumbnail((1024, 1024))
             images_batch.append(img)
-            img_texts = texts_map.get(rec["image_path"], [])
-            if img_texts:
-                user_text = USER_PROMPT_TEMPLATE.format(texts=", ".join(img_texts))
+            texts = len(texts_map.get(rec["image_path"], []))
+            if texts:
+                user_text = USER_PROMPT_NO_TEXT #USER_PROMPT_TEMPLATE.format(texts=texts)
             else:
                 user_text = USER_PROMPT_NO_TEXT
             messages_batch.append([
@@ -122,17 +122,17 @@ def generate_captions(
                 ]},
             ])
 
-        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages_batch]
+        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True, enable_thinking=False) for m in messages_batch]
         inputs = processor(
             text=texts, images=images_batch, padding=True, return_tensors="pt",
         ).to(model.device)
 
         with torch.inference_mode():
-            output_ids = model.generate(**inputs, max_new_tokens=80, do_sample=False)
+            output_ids = model.generate(**inputs, max_new_tokens=150, do_sample=False)
 
-        input_len = inputs.input_ids.shape[1]
-        for rec, out_ids in zip(batch_recs, output_ids):
-            caption = processor.decode(out_ids[input_len:], skip_special_tokens=True).strip()
+        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, output_ids)]
+        for rec, ids in zip(batch_recs, trimmed):
+            caption = processor.decode(ids, skip_special_tokens=True).strip()
             captions[rec["image_path"]] = caption
 
         if len(captions) <= 30:

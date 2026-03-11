@@ -23,4 +23,5 @@ accelerate launch --num_processes 2 training/train_lora_z_image_simple_attend.py
     --gradient_checkpointing \
     --checkpointing_steps 500 \
     --char_loss_lambda 0.05 \
-    --char_loss_layers 12,13,14,15,16
+    --char_loss_layers 12,13,14,15,16 \
+    --resume_from_checkpoint /scratch2/shaush/training_output/lora_attend/checkpoint-1500
