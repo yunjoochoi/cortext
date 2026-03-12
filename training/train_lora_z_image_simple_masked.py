@@ -1,20 +1,4 @@
-"""Z-Image LoRA fine-tuning on manifest.jsonl
-
-accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
-    --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
-    --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
-    --output_dir /scratch2/shaush/training_output/lora_simple \
-    --max_pixels 1048576 \
-    --train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --max_train_steps 5000 \
-    --learning_rate 1e-4 \
-    --rank 16 \
-    --mixed_precision bf16 \
-    --gradient_checkpointing \
-    --checkpointing_steps 500
-    
-"""
+"""Z-Image LoRA fine-tuning with bbox-masked loss (text region only)."""
 
 import argparse
 import copy
@@ -150,17 +134,49 @@ class ManifestDataset(Dataset):
         if (new_w, new_h) != (orig_w, orig_h):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
+        # Scale bboxes to resized image coordinates
+        sx, sy = new_w / orig_w, new_h / orig_h
+        bboxes = []
+        bbox_dict = rec.get("bbox", {})
+        for key in bbox_dict:
+            x, y, w, h = bbox_dict[key]
+            bboxes.append([x * sx, y * sy, w * sx, h * sy])
+
         texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
         return {
             "pixel_values": self.to_tensor(image),
             "prompt": build_prompt(rec.get("caption", ""), texts),
+            "bboxes": bboxes,
+            "img_size": (new_h, new_w),
         }
+
+
+VAE_SCALE_FACTOR = 8
+
+
+def build_latent_mask(bboxes: list, img_size: tuple, device: torch.device) -> torch.Tensor:
+    """Build a binary mask in latent space from pixel-space COCO bboxes [x,y,w,h]."""
+    h, w = img_size
+    lh, lw = h // VAE_SCALE_FACTOR, w // VAE_SCALE_FACTOR
+    mask = torch.zeros(1, 1, lh, lw, device=device)
+    for x, y, bw, bh in bboxes:
+        lx0 = max(0, int(x) // VAE_SCALE_FACTOR)
+        ly0 = max(0, int(y) // VAE_SCALE_FACTOR)
+        lx1 = min(lw, int(x + bw + VAE_SCALE_FACTOR - 1) // VAE_SCALE_FACTOR)
+        ly1 = min(lh, int(y + bh + VAE_SCALE_FACTOR - 1) // VAE_SCALE_FACTOR)
+        mask[:, :, ly0:ly1, lx0:lx1] = 1.0
+    return mask
 
 
 def collate_fn(examples):
     pixel_values = torch.stack([e["pixel_values"] for e in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    return {"pixel_values": pixel_values, "prompts": [e["prompt"] for e in examples]}
+    return {
+        "pixel_values": pixel_values,
+        "prompts": [e["prompt"] for e in examples],
+        "bboxes": [e["bboxes"] for e in examples],
+        "img_sizes": [e["img_size"] for e in examples],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +235,8 @@ def main():
     lora_config = LoraConfig(
         r=args.rank, lora_alpha=args.lora_alpha,
         init_lora_weights="gaussian",
-        # target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "w1", "w2", "w3"],
+
     )
     transformer.add_adapter(lora_config)
     if args.gradient_checkpointing:
@@ -278,7 +294,7 @@ def main():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("z-image-lora-simple", config=vars(args))
+        accelerator.init_trackers("z-image-lora-simple-masked", config=vars(args))
     if args.allow_tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -396,12 +412,22 @@ def main():
                 model_pred = torch.stack(model_pred_list, dim=0).squeeze(2)
                 model_pred = -model_pred  # Z-Image negates
 
-                # Loss
+                # Bbox mask in latent space
+                masks = torch.cat([
+                    build_latent_mask(batch["bboxes"][i], batch["img_sizes"][i], model_input.device)
+                    for i in range(bsz)
+                ], dim=0)  # (B, 1, lH, lW)
+
+                # Loss (masked to text regions only)
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
                 target = noise - model_input
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(bsz, -1), 1)
-                loss = loss.mean()
+                per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
+                masked_loss = per_pixel_loss * masks.float()
+                # Mean over masked region per sample
+                n_channels = model_input.shape[1]
+                mask_sums = masks.reshape(bsz, -1).sum(dim=1) * n_channels
+                mask_sums = mask_sums.clamp(min=1.0)
+                loss = (masked_loss.reshape(bsz, -1).sum(dim=1) / mask_sums).mean()
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

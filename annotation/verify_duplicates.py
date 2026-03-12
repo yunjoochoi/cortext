@@ -15,13 +15,10 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from core.utils import read_jsonl, write_jsonl
 
-QWEN_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+QWEN_MODEL = "/scratch2/shaush/models/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 FONT_PATH = str(Path(__file__).resolve().parents[1] / "NotoSansKR-VariableFont_wght.ttf")
 
-BBOX_COLORS = [
-    "red", "blue", "green", "orange", "purple",
-    "cyan", "magenta", "yellow", "lime", "deeppink",
-]
+BBOX_COLOR = "green"
 
 SYSTEM_PROMPT = (
     "You are a Korean signage annotation quality checker. "
@@ -36,9 +33,11 @@ The colored/numbered rectangles on the image correspond to each option's boundin
 
 {options_block}
 
+IMPORTANT: Only Korean text is annotated. Numbers, English, and other non-Korean characters are intentionally excluded from annotations and bboxes. Do NOT reject an option just because numbers or English text on the sign are not annotated.
+
 Pick the BEST annotation option (1-indexed) based on these criteria IN ORDER:
-0) OCR accuracy: the texts must correctly match what is actually written in the image. If none are correct, return 0.
-1) Bbox quality: each bbox must tightly cover its corresponding text, not cutting through characters or misaligned. If the best option still has bad bboxes, return 0.
+0) OCR accuracy: the Korean texts must correctly match what is actually written in the image. If none are correct, return 0.
+1) Bbox quality: each bbox must cover its corresponding Korean text without cutting through characters. Minor looseness is acceptable. If the best option has severely misaligned bboxes, return 0.
 2) If multiple options are both correct, prefer the one with MORE text elements and longer text content.
 3) Prefer single spaces over double spaces ("  " -> " "), and fewer spaces overall.
 4) Prefer texts listed in natural reading order (top-to-bottom, left-to-right).
@@ -61,16 +60,18 @@ def draw_bboxes_on_image(
     """Draw labeled bboxes on a copy of the image. bbox format: [x, y, w, h]."""
     img = img.copy()
     draw = ImageDraw.Draw(img)
+    fs = max(img.height // 25, 24)
+    lw = max(fs // 8, 2)
     try:
-        font = ImageFont.truetype(FONT_PATH, 20)
+        font = ImageFont.truetype(FONT_PATH, fs)
     except OSError:
-        font = ImageFont.load_default(size=20)
+        font = ImageFont.load_default(size=fs)
 
     for i, (text, box) in enumerate(bboxes.items()):
         x, y, w, h = box
-        draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=lw)
         label = f"{label_prefix}-{i}: {text}"
-        draw.text((x + 2, max(0, y - 22)), label, fill=color, font=font)
+        draw.text((x + 2, max(0, y - fs - 4)), label, fill=color, font=font)
     return img
 
 
@@ -90,8 +91,7 @@ def build_annotated_images(
     """Return one annotated image per option, each with its bboxes drawn."""
     images = []
     for i, rec in enumerate(records):
-        color = BBOX_COLORS[i % len(BBOX_COLORS)]
-        annotated = draw_bboxes_on_image(base_img, rec.get("bbox", {}), color, f"Opt{i+1}")
+        annotated = draw_bboxes_on_image(base_img, rec.get("bbox", {}), BBOX_COLOR, f"Opt{i+1}")
         images.append(annotated)
     return images
 
@@ -149,14 +149,15 @@ def verify_duplicates(
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, device_map="auto",
     )
-    try:
-        processor = AutoProcessor.from_pretrained(model_name)
-    except OSError:
-        processor = AutoProcessor.from_pretrained(QWEN_MODEL)
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
 
     # Step 3: judge each group
+    debug_dir = output_path.parent / "verify_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_count = 0
     chosen_records = []
     rejected_count = 0
+    judgments = []  # metadata for post-processing
 
     for h, recs in tqdm(groups_to_judge.items(), desc="Judging"):
         base_img = Image.open(recs[0]["image_path"]).convert("RGB")
@@ -201,15 +202,42 @@ def verify_duplicates(
             nums = re.findall(r"\d+", answer)
             choice = int(nums[0]) if nums else 0
 
+        rejected = choice == 0 or choice > len(recs)
+        for j, ann_img in enumerate(annotated_images):
+            if rejected:
+                tag = "_REJECT"
+            elif j + 1 == choice:
+                tag = "_CHOSEN"
+            else:
+                tag = ""
+            name = f"group{debug_count:04d}_opt{j+1:02d}{tag}.jpg"
+            ann_img.save(debug_dir / name)
+        debug_count += 1
+
+        judgment = {
+            "hash": h,
+            "choice": choice,
+            "paths": [r["image_path"] for r in recs],
+            "keep": None,
+            "remove": [r["image_path"] for r in recs],
+        }
         if choice == 0 or choice > len(recs):
             rejected_count += 1
             print(f"  Rejected group {h[:8]}... ({len(recs)} options, answer={answer})")
         else:
             winner = recs[choice - 1]
             chosen_records.append(winner)
+            judgment["keep"] = winner["image_path"]
+            judgment["remove"] = [p for p in judgment["paths"] if p != winner["image_path"]]
             print(f"  Group {h[:8]}...: picked option {choice}/{len(recs)}")
+        judgments.append(judgment)
 
     print(f"\n  VLM judged {len(groups_to_judge)} groups: {len(chosen_records)} chosen, {rejected_count} rejected")
+
+    # Save judgment metadata
+    judgment_path = output_path.parent / "verify_judgments.jsonl"
+    write_jsonl(judgment_path, judgments)
+    print(f"  Judgment metadata -> {judgment_path}")
 
     final_records = unique_records + chosen_records
     _write_output(final_records, output_path)

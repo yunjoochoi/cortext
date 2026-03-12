@@ -13,7 +13,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from core.utils import read_jsonl, write_jsonl
 
-QWEN_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+QWEN_MODEL = "/scratch2/shaush/models/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 
 SYSTEM_PROMPT = (
     "You are a image captioner. "
@@ -92,11 +92,7 @@ def generate_captions(
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, device_map="auto",
     )
-    # processor needs tokenizer/image_processor configs that may not exist in local weight-only dirs
-    try:
-        processor = AutoProcessor.from_pretrained(model_name)
-    except OSError:
-        processor = AutoProcessor.from_pretrained(QWEN_MODEL)
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
     processor.tokenizer.padding_side = "left"
 
     captions = {}

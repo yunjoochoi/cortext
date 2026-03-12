@@ -9,13 +9,13 @@ eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
 
 echo "=== Step 1: Score manifest and split into curriculum tiers ==="
-python core/difficulty.py \
+python -m core.difficulty \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
     --out /scratch2/shaush/coreset_output/manifest_scored.jsonl
 
 echo ""
 echo "=== Step 2: Generate hard negatives ==="
-python dataset/hard_negative.py \
+python -m dataset.hard_negative \
     --scored_manifest /scratch2/shaush/coreset_output/manifest_scored.jsonl \
     --out /scratch2/shaush/coreset_output/hard_negatives.jsonl
 

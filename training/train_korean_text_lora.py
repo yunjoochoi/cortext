@@ -184,7 +184,7 @@ def parse_args():
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--checkpointing_steps", type=int, default=500)
-    p.add_argument("--checkpoints_total_limit", type=int, default=3)
+    p.add_argument("--checkpoints_total_limit", type=int, default=10)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
     p.add_argument("--allow_tf32", action="store_true")
     p.add_argument("--report_to", type=str, default="tensorboard")

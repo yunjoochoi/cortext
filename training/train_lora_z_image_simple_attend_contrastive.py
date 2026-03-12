@@ -37,6 +37,7 @@ from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
+from core.jamo import substitute_per_char
 
 from diffusers import (
     AutoencoderKL,
@@ -60,7 +61,6 @@ from transformers import Qwen2Tokenizer, Qwen3Model
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from core.jamo import substitute_one_jamo
 
 logger = get_logger(__name__)
 
@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--checkpointing_steps", type=int, default=500)
-    p.add_argument("--checkpoints_total_limit", type=int, default=3)
+    p.add_argument("--checkpoints_total_limit", type=int, default=10)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
     p.add_argument("--offload", action="store_true")
     p.add_argument("--allow_tf32", action="store_true")
@@ -117,7 +117,7 @@ def parse_args():
                    help="Temperature for InfoNCE contrastive loss")
     p.add_argument("--font_path", type=str, default=None,
                    help="Path to Korean TTF font for synthetic text rendering")
-    p.add_argument("--synthetic_size", type=int, default=512,
+    p.add_argument("--synthetic_size", type=int, default=256,
                    help="Resolution for synthetic rendered text images (must be divisible by 16)")
     return p.parse_args()
 
@@ -280,11 +280,8 @@ def find_text_token_indices(tokenizer, prompt, texts, max_length):
 
 
 def generate_hard_negative(text: str) -> str | None:
-    """Generate a 1-jamo confusable variant of Korean text on-the-fly."""
-    candidates = substitute_one_jamo(text)
-    if not candidates:
-        return None
-    return random.choice(candidates)[0]
+    """Generate a confusable variant: one jamo substituted per syllable."""
+    return substitute_per_char(text)
 
 
 def render_text_image(
@@ -311,7 +308,7 @@ def render_text_image(
     # center text accounting for bbox offset
     x = (w - tw) // 2 - x0
     y = (h - th) // 2 - y0
-    sw = max(fs // 15 - 1, 1)
+    sw = max(fs // 30, 1) # 수정전: sw = max(fs // 15 - 1, 1)
     draw.text((x, y), text, fill="black", font=font, stroke_width=sw, stroke_fill="black")
     return img
 
@@ -339,10 +336,10 @@ def compute_contrastive_loss(
         x = capture.stored.get(f"x_{layer_idx}")
         if x is None or x.shape[0] < 2:
             continue
-        # image tokens → spatial mean pool
+        # image tokens -> spatial mean pool
         pos_img_h = x[0, :synth_img_seq_len].mean(dim=0)
         neg_img_h = x[1, :synth_img_seq_len].mean(dim=0)
-        # text tokens → mean pool (same prompt for both, use batch 0)
+        # text tokens -> mean pool (same prompt for both, use batch 0)
         txt_h = x[0, synth_img_seq_len:].mean(dim=0)
 
         pos_img_h = F.normalize(pos_img_h.float(), dim=-1)
@@ -367,8 +364,8 @@ def log_layer_similarity_gaps(
 ):
     """Log per-layer similarity gap (pos_sim - neg_sim) for contrastive layer selection.
 
-    Layers with SMALL gap = model can't distinguish confusable pairs → contrastive helps most.
-    Layers with LARGE gap = already discriminative → less benefit.
+    Layers with SMALL gap = model can't distinguish confusable pairs -> contrastive helps most.
+    Layers with LARGE gap = already discriminative -> less benefit.
     """
     gaps = {}
     for layer_idx in layer_indices:
@@ -590,7 +587,7 @@ def main():
     )
 
     def encode_prompts(prompts):
-        """Encode prompts → List[Tensor[seq_len, hidden_dim]] (no CFG)."""
+        """Encode prompts -> List[Tensor[seq_len, hidden_dim]] (no CFG)."""
         with torch.no_grad():
             prompt_embeds, _ = text_encoding_pipeline.encode_prompt(
                 prompt=prompts,
@@ -859,7 +856,7 @@ def main():
                             anchor, args.synthetic_size, args.font_path)
                         neg_img = render_text_image(
                             neg_text, args.synthetic_size, args.font_path)
-                        # Resize neg to match pos (same char count → similar size, but ensure stack works)
+                        # Resize neg to match pos (same char count -> similar size, but ensure stack works)
                         if neg_img.size != pos_img.size:
                             neg_img = neg_img.resize(pos_img.size, Image.BILINEAR)
 

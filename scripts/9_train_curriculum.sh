@@ -16,13 +16,14 @@ accelerate launch --num_processes 2 training/train_lora_z_image_curriculum.py \
     --max_pixels 1048576 \
     --train_batch_size 1 \
     --gradient_accumulation_steps 8 \
-    --steps_per_phase 1500 \
+    --steps_per_phase 6250 \
     --learning_rate 1e-4 \
     --rank 16 \
     --mixed_precision bf16 \
     --gradient_checkpointing \
     --checkpointing_steps 500
-
+    
+# 전체 데이터를 10에폭 보도록 페이즈 맞춤 - --steps_per_phase 6250 
 
 # 중간에 죽었을 때 재실행 
 # --resume_from_checkpoint latest

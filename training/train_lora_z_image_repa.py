@@ -1,20 +1,4 @@
-"""Z-Image LoRA fine-tuning on manifest.jsonl
-
-accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
-    --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
-    --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
-    --output_dir /scratch2/shaush/training_output/lora_simple \
-    --max_pixels 1048576 \
-    --train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --max_train_steps 5000 \
-    --learning_rate 1e-4 \
-    --rank 16 \
-    --mixed_precision bf16 \
-    --gradient_checkpointing \
-    --checkpointing_steps 500
-    
-"""
+"""Z-Image LoRA fine-tuning with bbox-masked loss + REPA-style OCR alignment."""
 
 import argparse
 import copy
@@ -25,7 +9,10 @@ import os
 import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
@@ -57,15 +44,146 @@ from transformers import Qwen2Tokenizer, Qwen3Model
 
 logger = get_logger(__name__)
 
+VAE_SCALE_FACTOR = 8
+DIT_PATCH_SIZE = 2  # Z-Image patchifies latents with patch_size=2
 
+
+# ---------------------------------------------------------------------------
+# Projection MLP (REPA-style: DiT hidden → OCR feature dim)
+# ---------------------------------------------------------------------------
+class ProjectionMLP(nn.Module):
+    def __init__(self, dit_dim: int, proj_dim: int, ocr_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dit_dim, proj_dim),
+            nn.SiLU(),
+            nn.Linear(proj_dim, proj_dim),
+            nn.SiLU(),
+            nn.Linear(proj_dim, ocr_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# OCR encoder wrapper (EasyOCR CRNN)
+# ---------------------------------------------------------------------------
+class OCREncoder:
+    def __init__(self, lang: str = "ko", device: torch.device = torch.device("cpu")):
+        import easyocr
+        self.reader = easyocr.Reader([lang], gpu=(device.type == "cuda"), verbose=False)
+        self.model = self.reader.recognizer.module
+        self.model.eval()
+        self.device = device
+        self._seq_features = None
+        self._hook = self.model.SequenceModeling.register_forward_hook(self._capture_hook)
+
+    def _capture_hook(self, module, input, output):
+        if isinstance(output, tuple):
+            self._seq_features = output[0].detach()
+        else:
+            self._seq_features = output.detach()
+
+    @property
+    def embed_dim(self) -> int:
+        return 256  # EasyOCR BiLSTM hidden_size * 2 directions / 2 = 256
+
+    @torch.no_grad()
+    def encode_crop(self, crop: Image.Image, target_h: int = 64) -> torch.Tensor:
+        """Encode a single text crop → (1, T, D) sequence features."""
+        w, h = crop.size
+        ratio = target_h / h
+        target_w = max(int(w * ratio), 1)
+        img = crop.resize((target_w, target_h), Image.BILINEAR).convert("L")
+        arr = np.array(img).astype("float32") / 255.0
+        arr = (arr - 0.5) / 0.5
+        tensor = torch.from_numpy(arr[np.newaxis, np.newaxis]).to(self.device)  # (1, 1, H, W)
+        self._seq_features = None
+        self.model(tensor, text="")
+        return self._seq_features  # (1, T, 256)
+
+
+# ---------------------------------------------------------------------------
+# Bbox → DiT patch token indices
+# ---------------------------------------------------------------------------
+def bbox_to_dit_patch_indices(
+    bbox: list, img_h: int, img_w: int,
+) -> list[int]:
+    """Map pixel-space COCO bbox [x,y,w,h] to DiT patch token indices.
+
+    DiT patchifies the latent (lH, lW) with patch_size=2,
+    giving a grid of (lH/2, lW/2) patches, flattened row-major.
+    """
+    lh = img_h // VAE_SCALE_FACTOR
+    lw = img_w // VAE_SCALE_FACTOR
+    grid_h = lh // DIT_PATCH_SIZE
+    grid_w = lw // DIT_PATCH_SIZE
+
+    x, y, bw, bh = bbox
+    # Convert pixel bbox to patch grid coordinates
+    px0 = max(0, int(x) // (VAE_SCALE_FACTOR * DIT_PATCH_SIZE))
+    py0 = max(0, int(y) // (VAE_SCALE_FACTOR * DIT_PATCH_SIZE))
+    px1 = min(grid_w, math.ceil((x + bw) / (VAE_SCALE_FACTOR * DIT_PATCH_SIZE)))
+    py1 = min(grid_h, math.ceil((y + bh) / (VAE_SCALE_FACTOR * DIT_PATCH_SIZE)))
+
+    indices = []
+    for r in range(py0, py1):
+        for c in range(px0, px1):
+            indices.append(r * grid_w + c)
+    return indices
+
+
+# ---------------------------------------------------------------------------
+# REPA alignment loss
+# ---------------------------------------------------------------------------
+def compute_repa_loss(
+    dit_hidden: torch.Tensor,       # (N, T_img + T_txt, D) from hook
+    ocr_features: torch.Tensor,     # (1, T_ocr, ocr_dim)
+    patch_indices: list[int],        # which dit image patches correspond to bbox
+    projector: ProjectionMLP,
+    img_seq_len: int,                # number of image tokens in dit_hidden
+) -> torch.Tensor:
+    """Compute REPA-style alignment loss between DiT bbox patches and OCR features."""
+    if len(patch_indices) == 0:
+        return torch.tensor(0.0, device=dit_hidden.device)
+
+    # Extract image-only tokens, then select bbox patches
+    img_tokens = dit_hidden[0, :img_seq_len]  # (T_img, D)
+    idx = torch.tensor(patch_indices, device=img_tokens.device)
+    bbox_tokens = img_tokens[idx]  # (N_patches, D)
+
+    # Project to OCR dimension
+    projected = projector(bbox_tokens.float())  # (N_patches, ocr_dim)
+
+    # Pool OCR features to match patch count (simple interpolation)
+    ocr_feat = ocr_features[0]  # (T_ocr, ocr_dim)
+    # Interpolate OCR sequence to match bbox patch count
+    ocr_interp = F.interpolate(
+        ocr_feat.unsqueeze(0).permute(0, 2, 1),  # (1, D, T_ocr)
+        size=len(patch_indices),
+        mode="linear",
+        align_corners=False,
+    ).permute(0, 2, 1).squeeze(0)  # (N_patches, ocr_dim)
+
+    # Cosine alignment (REPA-style: maximize cosine similarity)
+    projected_n = F.normalize(projected, dim=-1)
+    ocr_n = F.normalize(ocr_interp.detach().float(), dim=-1)
+    loss = -(projected_n * ocr_n).sum(dim=-1).mean()  # negative cosine similarity
+
+    return loss
+
+
+# ---------------------------------------------------------------------------
+# Args, dataset, mask (same as simple_masked)
+# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     p.add_argument("--manifest", type=str, required=True)
-    p.add_argument("--output_dir", type=str, default="z-image-lora-simple")
+    p.add_argument("--output_dir", type=str, default="z-image-lora-repa")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max_pixels", type=int, default=1024*1024,
-                   help="Max total pixels; images are scaled down to fit (aspect ratio preserved, 16-aligned)")
+    p.add_argument("--max_pixels", type=int, default=1024*1024)
     p.add_argument("--train_batch_size", type=int, default=1)
     p.add_argument("--num_train_epochs", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=None)
@@ -95,8 +213,14 @@ def parse_args():
     p.add_argument("--validation_prompt", type=str, default=None)
     p.add_argument("--validation_epochs", type=int, default=50)
     p.add_argument("--num_validation_images", type=int, default=4)
-    p.add_argument("--cache_latents", action="store_true")
     p.add_argument("--use_8bit_adam", action="store_true")
+    # REPA-specific args
+    p.add_argument("--repa_coeff", type=float, default=0.5,
+                   help="Weight for REPA alignment loss")
+    p.add_argument("--repa_layer", type=int, default=8,
+                   help="DiT layer index to extract hidden states from (0-indexed)")
+    p.add_argument("--proj_dim", type=int, default=1024,
+                   help="Projection MLP intermediate dimension")
     return p.parse_args()
 
 
@@ -107,11 +231,8 @@ def build_prompt(caption: str, texts: list) -> str:
     return f"A signage photo, texts are written on it: {text_str}"
 
 
-# ---------------------------------------------------------------------------
-# Dataset: reads manifest.jsonl, builds prompt from caption + text
-# ---------------------------------------------------------------------------
 class ManifestDataset(Dataset):
-    ALIGN = 16  # must be divisible by vae_scale_factor(8) * patch_size(2)
+    ALIGN = 16
 
     def __init__(self, manifest_path: str, max_pixels: int = 1024 * 1024):
         self.records = []
@@ -130,7 +251,6 @@ class ManifestDataset(Dataset):
         return len(self.records)
 
     def _fit_size(self, w: int, h: int) -> tuple[int, int]:
-        """Scale down to fit max_pixels, then floor-align to ALIGN."""
         if w * h > self.max_pixels:
             scale = (self.max_pixels / (w * h)) ** 0.5
             w, h = int(w * scale), int(h * scale)
@@ -150,17 +270,50 @@ class ManifestDataset(Dataset):
         if (new_w, new_h) != (orig_w, orig_h):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
+        sx, sy = new_w / orig_w, new_h / orig_h
+        bboxes = []
+        texts_for_bbox = []
+        bbox_dict = rec.get("bbox", {})
+        for key in bbox_dict:
+            x, y, w, h = bbox_dict[key]
+            bboxes.append([x * sx, y * sy, w * sx, h * sy])
+            texts_for_bbox.append(key)
+
         texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
         return {
             "pixel_values": self.to_tensor(image),
+            "image": image,  # keep PIL for OCR crop
             "prompt": build_prompt(rec.get("caption", ""), texts),
+            "bboxes": bboxes,
+            "bbox_texts": texts_for_bbox,
+            "img_size": (new_h, new_w),
         }
+
+
+def build_latent_mask(bboxes: list, img_size: tuple, device: torch.device) -> torch.Tensor:
+    h, w = img_size
+    lh, lw = h // VAE_SCALE_FACTOR, w // VAE_SCALE_FACTOR
+    mask = torch.zeros(1, 1, lh, lw, device=device)
+    for x, y, bw, bh in bboxes:
+        lx0 = max(0, int(x) // VAE_SCALE_FACTOR)
+        ly0 = max(0, int(y) // VAE_SCALE_FACTOR)
+        lx1 = min(lw, int(x + bw + VAE_SCALE_FACTOR - 1) // VAE_SCALE_FACTOR)
+        ly1 = min(lh, int(y + bh + VAE_SCALE_FACTOR - 1) // VAE_SCALE_FACTOR)
+        mask[:, :, ly0:ly1, lx0:lx1] = 1.0
+    return mask
 
 
 def collate_fn(examples):
     pixel_values = torch.stack([e["pixel_values"] for e in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    return {"pixel_values": pixel_values, "prompts": [e["prompt"] for e in examples]}
+    return {
+        "pixel_values": pixel_values,
+        "images": [e["image"] for e in examples],
+        "prompts": [e["prompt"] for e in examples],
+        "bboxes": [e["bboxes"] for e in examples],
+        "bbox_texts": [e["bbox_texts"] for e in examples],
+        "img_sizes": [e["img_size"] for e in examples],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +328,7 @@ def main():
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=str(logging_dir)),
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO)
 
@@ -189,8 +342,6 @@ def main():
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-
-    # Resolution is handled per-image in ManifestDataset (max_pixels + 16-align)
 
     # ---- Load models ----
     tokenizer = Qwen2Tokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -219,7 +370,6 @@ def main():
     lora_config = LoraConfig(
         r=args.rank, lora_alpha=args.lora_alpha,
         init_lora_weights="gaussian",
-        # target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "w1", "w2", "w3"],
     )
     transformer.add_adapter(lora_config)
@@ -228,14 +378,35 @@ def main():
     if args.mixed_precision == "fp16":
         cast_training_params([transformer], dtype=torch.float32)
 
-    # ---- Text encoding pipeline (reuses text_encoder + tokenizer) ----
+    # ---- OCR encoder (frozen) ----
+    ocr_encoder = OCREncoder(lang="ko", device=accelerator.device)
+    logger.info(f"OCR encoder loaded: EasyOCR CRNN, embed_dim={ocr_encoder.embed_dim}")
+
+    # ---- Projection MLP ----
+    dit_dim = transformer.config["dim"]  # 3840
+    projector = ProjectionMLP(dit_dim, args.proj_dim, ocr_encoder.embed_dim)
+    projector.to(accelerator.device, dtype=torch.float32)
+    logger.info(f"Projector: {dit_dim} → {args.proj_dim} → {ocr_encoder.embed_dim}")
+
+    # ---- DiT hidden state hook ----
+    dit_hidden_state = {}
+
+    def make_dit_hook(layer_idx):
+        def hook_fn(module, input, output):
+            dit_hidden_state[layer_idx] = output
+        return hook_fn
+
+    hook_handle = transformer.layers[args.repa_layer].register_forward_hook(
+        make_dit_hook(args.repa_layer))
+    logger.info(f"REPA hook registered at layer {args.repa_layer}/{len(transformer.layers)}")
+
+    # ---- Text encoding pipeline ----
     text_encoding_pipeline = ZImagePipeline(
         vae=vae, transformer=transformer, tokenizer=tokenizer,
         text_encoder=text_encoder, scheduler=noise_scheduler,
     )
 
     def encode_prompts(prompts):
-        """Encode prompts -> List[Tensor[seq_len, hidden_dim]] (no CFG)."""
         with torch.no_grad():
             prompt_embeds, _ = text_encoding_pipeline.encode_prompt(
                 prompt=prompts,
@@ -252,13 +423,19 @@ def main():
     )
     logger.info(f"Dataset: {len(train_dataset):,} samples")
 
-    # ---- Optimizer ----
-    trainable_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    # ---- Optimizer (LoRA params + projector params) ----
+    lora_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    proj_params = list(projector.parameters())
+    all_trainable = lora_params + proj_params
+    logger.info(f"Trainable params: {sum(p.numel() for p in all_trainable):,} "
+                f"(LoRA: {sum(p.numel() for p in lora_params):,}, "
+                f"Projector: {sum(p.numel() for p in proj_params):,})")
+
     if args.use_8bit_adam:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=args.learning_rate, weight_decay=1e-4)
+        optimizer = bnb.optim.AdamW8bit(all_trainable, lr=args.learning_rate, weight_decay=1e-4)
     else:
-        optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(all_trainable, lr=args.learning_rate, weight_decay=1e-4)
 
     # ---- LR scheduler ----
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -273,31 +450,14 @@ def main():
     )
 
     # ---- Accelerate prepare ----
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler)
+    transformer, projector, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        transformer, projector, optimizer, train_dataloader, lr_scheduler)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("z-image-lora-simple", config=vars(args))
+        accelerator.init_trackers("z-image-lora-repa", config=vars(args))
     if args.allow_tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
-
-    # ---- Pre-cache latents & prompt embeddings (after prepare, using prepared dataloader) ----
-    latents_cache = []
-    prompt_embeds_cache = []
-    if args.cache_latents:
-        logger.info("Caching latents and prompt embeddings...")
-        for batch in tqdm(train_dataloader, desc="Caching", disable=not accelerator.is_local_main_process):
-            with torch.no_grad():
-                pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                latents_cache.append(vae.encode(pv).latent_dist)
-                prompt_embeds_cache.append(encode_prompts(batch["prompts"]))
-        vae = vae.to("cpu")
-        del vae
-        text_encoding_pipeline.to("cpu")
-        del text_encoder, tokenizer
-        free_memory()
-        logger.info(f"Cached {len(latents_cache)} batches")
 
     # ---- Save/Load hooks ----
     def unwrap(model):
@@ -307,13 +467,14 @@ def main():
     def save_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             lora_layers = get_peft_model_state_dict(unwrap(transformer))
-            print("lora_layers: ", lora_layers)
             if weights:
-                print("weights: ", weights[:100])
                 weights.pop()
             ZImagePipeline.save_lora_weights(
                 output_dir, transformer_lora_layers=lora_layers,
                 **_collate_lora_metadata({"transformer": unwrap(transformer)}))
+            # Save projector separately
+            torch.save(unwrap(projector).state_dict(),
+                       os.path.join(output_dir, "projector.pt"))
 
     def load_hook(models, input_dir):
         while len(models) > 0:
@@ -324,6 +485,9 @@ def main():
         set_peft_model_state_dict(unwrap(transformer), t_state, adapter_name="default")
         if args.mixed_precision == "fp16":
             cast_training_params([unwrap(transformer)])
+        proj_path = os.path.join(input_dir, "projector.pt")
+        if os.path.exists(proj_path):
+            unwrap(projector).load_state_dict(torch.load(proj_path, map_location="cpu"))
 
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
@@ -360,17 +524,14 @@ def main():
     # ---- Training loop ----
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
+        projector.train()
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(transformer):
+            with accelerator.accumulate(transformer, projector):
                 # Encode
-                if args.cache_latents:
-                    prompt_embeds = prompt_embeds_cache[step % len(prompt_embeds_cache)]
-                    model_input = latents_cache[step % len(latents_cache)].mode()
-                else:
-                    with torch.no_grad():
-                        prompt_embeds = encode_prompts(batch["prompts"])
-                        pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                        model_input = vae.encode(pv).latent_dist.mode()
+                with torch.no_grad():
+                    prompt_embeds = encode_prompts(batch["prompts"])
+                    pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                    model_input = vae.encode(pv).latent_dist.mode()
 
                 model_input = (model_input - vae_shift) * vae_scale
                 noise = torch.randn_like(model_input)
@@ -383,7 +544,6 @@ def main():
                 indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
                 timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
 
-                # Flow matching: noisy input
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
                 timestep_normalized = (1000 - timesteps) / 1000
@@ -391,21 +551,74 @@ def main():
                 # Z-Image transformer expects List[Tensor(C,1,H,W)]
                 noisy_list = list(noisy_model_input.unsqueeze(2).unbind(dim=0))
 
+                # Clear hook state
+                dit_hidden_state.clear()
+
                 model_pred_list = transformer(
                     noisy_list, timestep_normalized, prompt_embeds, return_dict=False)[0]
                 model_pred = torch.stack(model_pred_list, dim=0).squeeze(2)
-                model_pred = -model_pred  # Z-Image negates
+                model_pred = -model_pred
 
-                # Loss
+                # ---- Masked MSE loss (same as simple_masked) ----
+                masks = torch.cat([
+                    build_latent_mask(batch["bboxes"][i], batch["img_sizes"][i], model_input.device)
+                    for i in range(bsz)
+                ], dim=0)
+
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
                 target = noise - model_input
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(bsz, -1), 1)
-                loss = loss.mean()
+                per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
+                masked_loss = per_pixel_loss * masks.float()
+                n_channels = model_input.shape[1]
+                mask_sums = masks.reshape(bsz, -1).sum(dim=1) * n_channels
+                mask_sums = mask_sums.clamp(min=1.0)
+                loss_mse = (masked_loss.reshape(bsz, -1).sum(dim=1) / mask_sums).mean()
+
+                # ---- REPA alignment loss ----
+                loss_repa = torch.tensor(0.0, device=accelerator.device)
+                repa_count = 0
+
+                if args.repa_layer in dit_hidden_state and args.repa_coeff > 0:
+                    hidden = dit_hidden_state[args.repa_layer]
+                    # hidden shape: (bsz, T_img + T_txt, dim) — joint attention tokens
+                    for i in range(bsz):
+                        img_h, img_w = batch["img_sizes"][i]
+                        lh = img_h // VAE_SCALE_FACTOR
+                        lw = img_w // VAE_SCALE_FACTOR
+                        img_seq_len = (lh // DIT_PATCH_SIZE) * (lw // DIT_PATCH_SIZE)
+
+                        for j, bbox in enumerate(batch["bboxes"][i]):
+                            patch_idx = bbox_to_dit_patch_indices(bbox, img_h, img_w)
+                            if len(patch_idx) == 0:
+                                continue
+
+                            # Crop text region from PIL image for OCR
+                            pil_img = batch["images"][i]
+                            x, y, bw, bh = bbox
+                            x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+                            crop = pil_img.crop((x, y, x + bw, y + bh))
+                            if crop.size[0] < 4 or crop.size[1] < 4:
+                                continue
+
+                            ocr_feat = ocr_encoder.encode_crop(crop)  # (1, T_ocr, 256)
+                            if ocr_feat is None:
+                                continue
+
+                            h_i = hidden[i].unsqueeze(0) if hidden.dim() == 3 else hidden[i:i+1]
+                            repa_l = compute_repa_loss(
+                                h_i, ocr_feat, patch_idx, projector, img_seq_len)
+                            loss_repa = loss_repa + repa_l
+                            repa_count += 1
+
+                if repa_count > 0:
+                    loss_repa = loss_repa / repa_count
+
+                # ---- Total loss ----
+                loss = loss_mse + args.repa_coeff * loss_repa
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(all_trainable, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -424,7 +637,12 @@ def main():
                     accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
                     logger.info(f"Saved checkpoint-{global_step}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "loss_mse": loss_mse.detach().item(),
+                "loss_repa": loss_repa.detach().item() if isinstance(loss_repa, torch.Tensor) else 0.0,
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -441,7 +659,6 @@ def main():
                       for _ in range(args.num_validation_images)]
             for tracker in accelerator.trackers:
                 if tracker.name == "tensorboard":
-                    import numpy as np
                     tracker.writer.add_images("validation",
                         np.stack([np.asarray(img) for img in images]), epoch, dataformats="NHWC")
             del pipeline
@@ -455,8 +672,11 @@ def main():
         ZImagePipeline.save_lora_weights(
             args.output_dir, transformer_lora_layers=lora_layers,
             **_collate_lora_metadata({"transformer": t}))
-        logger.info(f"LoRA saved to {args.output_dir}")
+        torch.save(unwrap(projector).state_dict(),
+                   os.path.join(args.output_dir, "projector.pt"))
+        logger.info(f"LoRA + projector saved to {args.output_dir}")
 
+    hook_handle.remove()
     accelerator.end_training()
 
 

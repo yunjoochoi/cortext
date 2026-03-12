@@ -75,3 +75,29 @@ def substitute_one_jamo(word: str) -> list[tuple[str, int, str, str]]:
                     results.append((new_word, syl_i, jong, alt))
 
     return results
+
+
+def substitute_per_char(word: str) -> str | None:
+    """Substitute one random confusable jamo per Korean syllable."""
+    import random
+    chars = list(word)
+    changed = False
+    for i, char in enumerate(chars):
+        if not ('가' <= char <= '힣'):
+            continue
+        cho, jung, jong = decompose(char)
+        options = []
+        for alt in JAMO_CONFUSABLE.get(cho, []):
+            if alt in _CHO_IDX:
+                options.append(compose(alt, jung, jong))
+        for alt in JAMO_CONFUSABLE.get(jung, []):
+            if alt in _JUNG_IDX:
+                options.append(compose(cho, alt, jong))
+        if jong:
+            for alt in JAMO_CONFUSABLE.get(jong, []):
+                if alt in _JONG_IDX:
+                    options.append(compose(cho, jung, alt))
+        if options:
+            chars[i] = random.choice(options)
+            changed = True
+    return "".join(chars) if changed else None
