@@ -689,6 +689,7 @@ def main():
                         logger.info(f"[char-loss debug] masks={n_masks}, token_matches={n_matched}, "
                                      f"char_loss={char_loss.item():.6f}")
 
+                char_loss = char_loss.clamp(min=0)
                 loss = loss_mse + args.char_loss_lambda * char_loss
 
                 accelerator.backward(loss)

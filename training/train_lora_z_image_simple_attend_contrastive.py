@@ -924,6 +924,7 @@ def main():
                                 f"loss={contrastive_loss.item():.6f}, "
                                 f"saved to {debug_dir}")
 
+                char_loss = char_loss.clamp(min=0)
                 loss = (loss_mse
                         + args.char_loss_lambda * char_loss
                         + args.contrastive_lambda * contrastive_loss)
