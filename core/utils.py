@@ -1,5 +1,29 @@
 import json
+import random
 from pathlib import Path
+
+
+
+TEXT_CONNECTORS = [
+    ", content and position of the texts are ",
+    ", textual material depicted in the image are ",
+    ", texts that say ",
+    ", captions shown in the snapshot are ",
+    ", with the words of ",
+    ", that reads ",
+    ", the written materials on the picture: ",
+    ", these texts are written on it: ",
+    ", captions are ",
+    ", content of the text in the graphic is ",
+]
+
+
+def build_prompt(caption: str, texts: list[str]) -> str:
+    text_str = ", ".join(f"'{t}'" for t in texts)
+    connector = random.choice(TEXT_CONNECTORS)
+    if caption:
+        return f"{caption}{connector}{text_str}"
+    return f"A signage photo{connector}{text_str}"
 
 
 def read_jsonl(path: str | Path):

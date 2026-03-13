@@ -11,8 +11,10 @@ Code for CLIPScore (https://arxiv.org/abs/2104.08718)
 
 import argparse
 import json
-import warnings
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import clip
 import numpy as np
@@ -22,6 +24,8 @@ import tqdm
 from packaging import version
 from PIL import Image
 from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
+
+from core.utils import build_prompt
 
 
 def parse_args():
@@ -136,7 +140,11 @@ def main():
             img_path = img_dir / f"{stem}_{s}.jpg"
             if img_path.exists():
                 image_paths.append(str(img_path))
-                captions.append(rec.get("caption", ""))
+                caption = rec.get("caption", "")
+                texts = rec.get("text", [])
+                if isinstance(texts, str):
+                    texts = [texts]
+                captions.append(build_prompt(caption, texts))
 
         if not image_paths:
             print(f"  Sample {s}: no images found, skipping")

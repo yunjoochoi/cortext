@@ -1,16 +1,16 @@
-"""Batch inference for Z-Image LoRA evaluation.
-
-Reads eval dataset jsonl, generates images using LoRA checkpoint,
-saves results for downstream evaluation (OCR accuracy, CLIPScore, FID).
-"""
+"""Batch inference for Z-Image LoRA evaluation."""
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from tqdm import tqdm
 
+from core.utils import build_prompt
 from diffusers import ZImagePipeline
 
 
@@ -39,15 +39,12 @@ def load_eval_dataset(path: str) -> list[dict]:
     return records
 
 
-def build_prompt(rec: dict) -> str:
+def build_eval_prompt(rec: dict) -> str:
     caption = rec.get("caption", "")
     texts = rec.get("text", [])
     if isinstance(texts, str):
         texts = [texts]
-    text_str = ", ".join(f"'{t}'" for t in texts)
-    if caption:
-        return f"{caption}, with {text_str} written on it"
-    return f"A signage photo, with {text_str} written on it"
+    return build_prompt(caption, texts)
 
 
 def main():
@@ -70,7 +67,7 @@ def main():
     # Use GT dimensions from dataset
     for idx, rec in enumerate(tqdm(records, desc="Generating")):
         stem = Path(rec["image_path"]).stem
-        prompt = build_prompt(rec)
+        prompt = build_eval_prompt(rec)
         h = rec.get("height", 1024)
         w = rec.get("width", 1024)
 
