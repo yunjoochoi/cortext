@@ -1,7 +1,6 @@
 """Detect and remove leaked text from VLM captions using Qwen3-VL (text-only)."""
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -16,25 +15,34 @@ from core.utils import read_jsonl, write_jsonl
 QWEN_MODEL = "/scratch2/shaush/models/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 
 SYSTEM_PROMPT = (
-    "You are a caption editor. Remove any text that was read from signs, banners, or labels. "
-    "This includes ANY language (Korean, English, Chinese, etc.), numbers, brand names, and symbols."
+    "You are a caption editor. You MUST remove ALL text that was read or transcribed from signs, "
+    "banners, labels, menus, or any visible surface in the image. This includes:\n"
+    "- ANY language (Korean, English, Chinese, Japanese, etc.)\n"
+    "- Brand names, store names, business names\n"
+    "- Phone numbers, addresses, street names\n"
+    "- Numbers read from signs (floor numbers like 2F, 3F, prices, percentages)\n"
+    "- Menu items, product names\n"
+    "- ANY text inside quotation marks — this is almost always transcribed from a sign\n\n"
+    "Keep generic scene descriptions (e.g. 'a restaurant sign', 'a storefront'). "
+    "Only remove the specific text/words that were read from the sign."
 )
 
 USER_PROMPT_TEMPLATE = (
     'Caption: "{caption}"\n\n'
-    'Step 1: List any text READ from signs — any language, numbers, brand names, phone numbers.\n'
-    'Text in quotes (e.g. "OPEN", "Barber Shop") is almost always read from a sign.\n'
+    "Identify ALL leaked text — any word, name, number, or phrase that was READ from a sign or surface.\n"
+    'Text in quotes (e.g. "OPEN", "Barber Shop", "2F") is almost always leaked.\n'
+    'Romanized Korean (e.g. "Gwangma Gongjaksu") is leaked.\n'
+    'Translated menu items (e.g. "Kimchi Stew") are leaked.\n'
     '"a barber shop exterior" = OK (scene description).\n'
-    '"a sign reading Barber Shop" / "the English words Barber shop" = leaked.\n'
-    'Step 2: If leaked text found, rewrite without it. Keep same style and length.\n'
-    'If none found, return caption as-is.\n\n'
+    '"a sign reading Barber Shop" / "the English words Barber Shop" = leaked.\n\n'
+    "If leaked text found, rewrite the caption without it. Keep same style and length.\n"
+    "If none found, return caption as-is.\n\n"
     'LEAKED: <list, or "none">\n'
-    'CLEAN: <cleaned caption>'
+    "CLEAN: <cleaned caption>"
 )
 
 
 def parse_response(text: str, original: str) -> tuple[str, str]:
-    """Parse model response into (leaked_text, clean_caption)."""
     leaked = "none"
     clean = original
     for line in text.strip().split("\n"):
@@ -46,34 +54,24 @@ def parse_response(text: str, original: str) -> tuple[str, str]:
     return leaked, clean
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True, help="Caption shard jsonl (with vlm_caption field)")
-    p.add_argument("--output", default=None, help="Output jsonl (default: input with _clean suffix)")
-    p.add_argument("--model", default=QWEN_MODEL)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--max_samples", type=int, default=None)
-    args = p.parse_args()
-
-    input_path = Path(args.input)
-    output_path = Path(args.output) if args.output else input_path.with_stem(input_path.stem + "_clean")
-
+def process_shard(
+    input_path: Path,
+    output_path: Path,
+    model: Qwen3VLForConditionalGeneration,
+    processor: AutoProcessor,
+    batch_size: int,
+) -> tuple[int, int]:
     records = list(read_jsonl(input_path))
-    if args.max_samples:
-        records = records[:args.max_samples]
-    print(f"Loaded {len(records):,} records from {input_path}")
-
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto",
-    )
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
-    processor.tokenizer.padding_side = "left"
+    print(f"\n{'='*60}")
+    print(f"Processing {input_path.name} ({len(records):,} records)")
+    print(f"  -> {output_path.name}")
+    print(f"{'='*60}")
 
     results = []
     fixed_count = 0
 
-    for i in tqdm(range(0, len(records), args.batch_size), desc="Verifying captions"):
-        batch = records[i : i + args.batch_size]
+    for i in tqdm(range(0, len(records), batch_size), desc=input_path.stem):
+        batch = records[i : i + batch_size]
         messages_batch = []
         for rec in batch:
             caption = rec.get("vlm_caption", "")
@@ -107,12 +105,53 @@ def main():
                 "was_fixed": was_fixed,
             })
 
-            if len(results) <= 20:
+            if len(results) <= 10:
                 status = "FIXED" if was_fixed else "OK"
                 print(f"  [{status}] {leaked} -> {clean[:80]}")
 
     write_jsonl(output_path, results)
-    print(f"\nDone: {fixed_count:,}/{len(results):,} captions fixed -> {output_path}")
+    print(f"  Done: {fixed_count:,}/{len(results):,} fixed -> {output_path}")
+    return len(results), fixed_count
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input_dir", required=True, help="Directory containing captions_shard_*.jsonl")
+    p.add_argument("--pattern", default="captions_shard_[0-9].jsonl", help="Glob pattern for shard files")
+    p.add_argument("--model", default=QWEN_MODEL)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing _clean files")
+    args = p.parse_args()
+
+    input_dir = Path(args.input_dir)
+    shard_files = sorted(input_dir.glob(args.pattern))
+    if not shard_files:
+        print(f"No files matching {args.pattern} in {input_dir}")
+        sys.exit(1)
+
+    print(f"Found {len(shard_files)} shards: {[f.name for f in shard_files]}")
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, device_map="auto",
+    )
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+    processor.tokenizer.padding_side = "left"
+
+    total_records = 0
+    total_fixed = 0
+
+    for shard_path in shard_files:
+        output_path = shard_path.with_stem(shard_path.stem + "_clean")
+        if output_path.exists() and not args.overwrite:
+            print(f"\nSkipping {shard_path.name} (_clean already exists, use --overwrite to redo)")
+            continue
+
+        n_records, n_fixed = process_shard(shard_path, output_path, model, processor, args.batch_size)
+        total_records += n_records
+        total_fixed += n_fixed
+
+    print(f"\n{'='*60}")
+    print(f"All done: {total_fixed:,}/{total_records:,} captions fixed across {len(shard_files)} shards")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ cd ~/cortext
 echo "=== Step 1: Score manifest and split into curriculum tiers ==="
 python -m core.difficulty \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
-    --out /scratch2/shaush/coreset_output/manifest_scored.jsonl
+    --out m coreset_output/manifest_scored.jsonl
 
 echo ""
 echo "=== Step 2: Generate hard negatives ==="

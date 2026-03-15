@@ -169,7 +169,7 @@ def compute_repa_loss(
     # Cosine alignment (REPA-style: maximize cosine similarity)
     projected_n = F.normalize(projected, dim=-1)
     ocr_n = F.normalize(ocr_interp.detach().float(), dim=-1)
-    loss = -(projected_n * ocr_n).sum(dim=-1).mean()  # negative cosine similarity
+    loss = -(projected_n * ocr_n).sum(dim=-1).mean()
 
     return loss
 
