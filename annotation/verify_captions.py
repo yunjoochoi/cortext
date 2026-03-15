@@ -16,21 +16,19 @@ from core.utils import read_jsonl, write_jsonl
 QWEN_MODEL = "/scratch2/shaush/models/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 
 SYSTEM_PROMPT = (
-    "You are a caption editor. Your job is to remove any leaked text from image captions. "
-    "Leaked text means any specific words, brand names, Korean characters, numbers, or phrases "
-    "that were transcribed from signs in the original image."
+    "You are a caption editor. Remove any text that was read from signs, banners, or labels. "
+    "This includes ANY language (Korean, English, Chinese, etc.), numbers, brand names, and symbols."
 )
 
 USER_PROMPT_TEMPLATE = (
-    'The following caption was supposed to describe only the visual scene, '
-    'but it may contain text that was read from signs in the image.\n\n'
     'Caption: "{caption}"\n\n'
-    'Step 1: List any specific text, words, brand names, Korean characters, numbers, '
-    'or sign content that appear in the caption (not general descriptive words).\n'
-    'Step 2: If leaked text was found, rewrite the caption WITHOUT any of that text. '
-    'Keep the same style and length. If no leaked text was found, return the caption as-is.\n\n'
-    'Reply in this exact format:\n'
-    'LEAKED: <comma-separated list, or "none">\n'
+    'Step 1: List any text READ from signs — any language, numbers, brand names, phone numbers.\n'
+    'Text in quotes (e.g. "OPEN", "Barber Shop") is almost always read from a sign.\n'
+    '"a barber shop exterior" = OK (scene description).\n'
+    '"a sign reading Barber Shop" / "the English words Barber shop" = leaked.\n'
+    'Step 2: If leaked text found, rewrite without it. Keep same style and length.\n'
+    'If none found, return caption as-is.\n\n'
+    'LEAKED: <list, or "none">\n'
     'CLEAN: <cleaned caption>'
 )
 

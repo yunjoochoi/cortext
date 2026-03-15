@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--report_to", type=str, default="tensorboard")
     p.add_argument("--logging_dir", type=str, default="logs")
     p.add_argument("--checkpointing_steps", type=int, default=500)
-    p.add_argument("--checkpoints_total_limit", type=int, default=None)
+    p.add_argument("--checkpoints_total_limit", type=int, default=10)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
     p.add_argument("--max_train_samples", type=int, default=None)
     p.add_argument("--snr_gamma", type=float, default=None)
