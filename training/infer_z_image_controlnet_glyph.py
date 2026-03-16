@@ -204,9 +204,6 @@ def main():
         )
         pipe.to("cuda")
 
-        # Load LoRA
-        pipe.load_lora_weights(ckpt_path)
-
         for i, sample in enumerate(samples):
             w, h = sample["width"], sample["height"]
             # Align to 16
@@ -237,7 +234,6 @@ def main():
 
             print(f"  [{i}] '{sample['prompt'][:60]}...' -> {out_path}")
 
-        pipe.unload_lora_weights()
         del pipe, controlnet
         torch.cuda.empty_cache()
 

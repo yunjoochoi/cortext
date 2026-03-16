@@ -9,4 +9,9 @@
 eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
 
-python dataset/manifest.py --category_filter "1.간판/1.가로형간판/가로형간판1"
+
+python dataset/manifest_jsonl.py \
+    --output /scratch2/shaush/coreset_output/manifest.jsonl \
+    --category_filter "1.간판/1.가로형간판/가로형간판1"
+
+

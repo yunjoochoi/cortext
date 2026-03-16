@@ -11,8 +11,8 @@ cd ~/cortext
 
 python training/infer_z_image_controlnet_glyph.py \
     --model_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
-    --training_dir /scratch2/shaush/training_output/lora_controlnet_glyph \
-    --output_dir /scratch2/shaush/training_output/lora_controlnet_glyph/infer_results \
+    --training_dir /scratch2/shaush/training_output/controlnet_glyph \
+    --output_dir /scratch2/shaush/training_output/controlnet_glyph/infer_results_guidance \
     --prompt \
         "A building with a blue sign, these texts are written on it: '카페라떼'" \
         "A restaurant storefront, these texts are written on it: '닭볶음탕'" \
@@ -29,6 +29,11 @@ python training/infer_z_image_controlnet_glyph.py \
         "300,300,400,120" \
         "250,400,500,150" \
     --height 880 --width 1184 \
+    --guidance_scale 7.5 \
     --num_inference_steps 50 \
-    --conditioning_scale 0.75 \
+    --conditioning_scale 1.5 \
     --seed 42
+
+
+    # --guidance_scale 5.0 \
+    # --conditioning_scale 0.75 \
