@@ -55,6 +55,7 @@ from diffusers.utils import convert_state_dict_to_diffusers, convert_unet_state_
 from diffusers.utils.torch_utils import is_compiled_module
 
 from models.jamo_combiner import JamoCombiner
+from core.utils import build_prompt
 
 logger = get_logger(__name__)
 
@@ -206,13 +207,6 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def build_prompt(texts: list[str], caption: str = "") -> str:
-    joined = " ".join(texts)
-    if caption:
-        return f"{caption}, with '{joined}' written on it."
-    return f"A signage photo with '{joined}' written on it."
-
-
 # bucket: 1024 × 768
 BUCKET_W, BUCKET_H = 1024, 768
 
@@ -224,7 +218,7 @@ class KoreanTextDataset(Dataset):
         with open(manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
-                if rec.get("text"):
+                if rec.get("annotations"):
                     self.records.append(rec)
         self.center_crop = center_crop
         self.random_flip = random_flip
@@ -258,12 +252,13 @@ class KoreanTextDataset(Dataset):
         image = crop(image, y1, x1, BUCKET_H, BUCKET_W)
         crop_top_left = (y1, x1)
 
-        texts = rec["text"]  # list of strings
+        texts = [ann["text"] for ann in rec["annotations"]]
+        pos_idxs = [ann.get("pos") for ann in rec["annotations"]]
         caption = rec.get("caption", "")
         return {
             "pixel_values": self.to_tensor(image),
             "text": texts,
-            "prompt": build_prompt(texts, caption),
+            "prompt": build_prompt(caption, texts, pos_idxs),
             "original_size": original_size,
             "crop_top_left": crop_top_left,
             "target_size": (BUCKET_H, BUCKET_W),
@@ -803,7 +798,7 @@ def main():
             pipeline = pipeline.to(accelerator.device)
             pipeline.set_progress_bar_config(disable=True)
             gen = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-            val_prompt = build_prompt([args.validation_prompt])
+            val_prompt = build_prompt("", [args.validation_prompt])
             images = [pipeline(val_prompt, generator=gen, num_inference_steps=30).images[0]
                       for _ in range(args.num_validation_images)]
             for tracker in accelerator.trackers:

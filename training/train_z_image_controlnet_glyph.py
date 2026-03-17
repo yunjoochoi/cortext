@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import random
 import shutil
 from pathlib import Path
 
@@ -37,24 +36,12 @@ from diffusers.training_utils import (
 from diffusers.utils.torch_utils import is_compiled_module
 from transformers import Qwen2Tokenizer, Qwen3Model
 
+from core.utils import build_prompt
+
 logger = get_logger(__name__)
 
 VAE_SCALE_FACTOR = 8
 FONT_PATH = str(Path(__file__).resolve().parent.parent / "NotoSansKR-VariableFont_wght.ttf")
-CONNECTORS = [
-    ", content and position of the texts are ",
-    ", textual material depicted in the image are ",
-    ", texts that say ",
-    ", captions shown in the snapshot are ",
-    ", with the words of ",
-    ", that reads ",
-    ", the written materials on the picture: ",
-    ", these texts are written on it: ",
-    ", captions are ",
-    ", content of the text in the graphic is ",
-]
-
-
 # ---------------------------------------------------------------------------
 # Glyph rendering
 # ---------------------------------------------------------------------------
@@ -168,14 +155,6 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def build_prompt(caption: str, texts: list) -> str:
-    connector = random.choice(CONNECTORS)
-    text_str = ", ".join(f"'{t}'" for t in texts)
-    if caption:
-        return f"{caption}{connector}{text_str}"
-    return f"A signage photo{connector}{text_str}"
-
-
 class ManifestDataset(Dataset):
     ALIGN = 16
 
@@ -184,7 +163,8 @@ class ManifestDataset(Dataset):
         with open(manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
-                if rec.get("text"):
+                anns = rec.get("annotations", [])
+                if anns:
                     self.records.append(rec)
         self.max_pixels = max_pixels
         self.font_path = font_path
@@ -218,22 +198,21 @@ class ManifestDataset(Dataset):
 
         sx, sy = new_w / orig_w, new_h / orig_h
         bboxes = []
-        bbox_texts = []
-        bbox_dict = rec.get("bbox", {})
-        for key in bbox_dict:
-            x, y, w, h = bbox_dict[key]
+        texts = []
+        pos_idxs = []
+        for ann in rec.get("annotations", []):
+            x, y, w, h = ann["bbox"]
             bboxes.append([x * sx, y * sy, w * sx, h * sy])
-            bbox_texts.append(key)
+            texts.append(ann["text"])
+            pos_idxs.append(ann.get("pos"))
 
-        # Render glyph canvas
         glyph_canvas = render_glyph_canvas(
-            new_w, new_h, bboxes, bbox_texts, self.font_path)
+            new_w, new_h, bboxes, texts, self.font_path)
 
-        texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
         return {
             "pixel_values": self.to_tensor(image),
             "glyph_values": self.to_tensor(glyph_canvas),
-            "prompt": build_prompt(rec.get("caption", ""), texts),
+            "prompt": build_prompt(rec.get("caption", ""), texts, pos_idxs),
         }
 
 

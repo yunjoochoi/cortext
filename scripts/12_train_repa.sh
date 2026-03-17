@@ -26,4 +26,4 @@ accelerate launch --num_processes 2 training/train_lora_z_image_repa.py \
     --repa_coeff 0.5 \
     --repa_layer 8 \
     --proj_dim 1024 \
-    --resume_from_checkpoint /scratch2/shaush/training_output/lora_repa/checkpoint-1000
+    --resume_from_checkpoint /scratch2/shaush/training_output/lora_repa/checkpoint-5000

@@ -18,12 +18,41 @@ TEXT_CONNECTORS = [
 ]
 
 
-def build_prompt(caption: str, texts: list[str]) -> str:
-    text_str = ", ".join(f"'{t}'" for t in texts)
+POS_LABELS = {
+    0: " top left",
+    1: " top",
+    2: " top right",
+    3: " left",
+    4: None,
+    5: " right",
+    6: " bottom left",
+    7: " bottom",
+    8: " bottom right",
+}
+
+
+def build_prompt(caption: str, texts: list[str], pos_idxs: list[int] | None = None) -> str:
+    base = caption if caption else "A signage photo"
     connector = random.choice(TEXT_CONNECTORS)
-    if caption:
-        return f"{caption}{connector}{text_str}"
-    return f"A signage photo{connector}{text_str}"
+
+    if pos_idxs and len(pos_idxs) == len(texts):
+        parts = []
+        for text, pos in zip(texts, pos_idxs):
+            if pos is None:
+                parts.append(f"'{text}'")
+                continue
+            pos_label = POS_LABELS[pos]
+            if pos_label is None:
+                pos_label = random.choice([" middle", " center"])
+            loc = random.choice([" located", " placed", " positioned", ""])
+            prep = random.choice([" at", " in", " on"])
+            parts.append(f"'{text}'{loc}{prep}{pos_label}")
+            print("in build_prompt, in utils.py : ", base + connector + ", ".join(parts) + ".")
+        
+        return base + connector + ", ".join(parts) + "."
+
+    text_str = ", ".join(f"'{t}'" for t in texts)
+    return base + connector + text_str
 
 
 def read_jsonl(path: str | Path):

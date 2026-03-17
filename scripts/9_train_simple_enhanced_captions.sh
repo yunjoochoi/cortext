@@ -13,7 +13,7 @@ export PYTHONPATH="$PWD:$PYTHONPATH"
 accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
     --pretrained_model_name_or_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
     --manifest /scratch2/shaush/coreset_output/manifest.jsonl \
-    --output_dir /scratch2/shaush/training_output/lora_simple \
+    --output_dir /scratch2/shaush/training_output/lora_simple_enhanced_captions \
     --max_pixels 1048576 \
     --train_batch_size 1 \
     --gradient_accumulation_steps 8 \
@@ -23,4 +23,3 @@ accelerate launch --num_processes 2 training/train_lora_z_image_simple.py \
     --mixed_precision bf16 \
     --gradient_checkpointing \
     --checkpointing_steps 500 \
-    --resume_from_checkpoint /scratch2/shaush/training_output/lora_simple/checkpoint-5000

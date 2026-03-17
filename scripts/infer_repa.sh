@@ -14,10 +14,10 @@ python training/infer_lora_z_image_simple.py \
     --training_dir /scratch2/shaush/training_output/lora_repa \
     --output_dir /scratch2/shaush/training_output/lora_repa/infer_results \
     --prompt \
-        "A building with a blue sign, with text '카페라떼' written on it" \
-        "A restaurant storefront, with text '닭볶음탕' written on it" \
-        "A street sign at night, with text '안녕하세요' written on it" \
-        "A shop entrance, with text '커피숍' written on it" \
+        "A close-up of a blue horizontal sign mounted on a beige concrete building under soft afternoon light, with the words of '카페라떼' located at center." \
+        "A wide shot of a Korean restaurant storefront with warm yellow lighting and a red awning at dusk, textual material depicted in the image are '닭볶음탕' placed on center." \
+        "A nighttime view of a narrow alley with neon-lit street signs reflecting on wet pavement, that reads '안녕하세요' positioned at center." \
+        "A daytime photograph of a small shop entrance with a wooden door and potted plants beside a glass window, the written materials on the picture: '커피숍' located in center." \
     --height 880 --width 1184 \
     --num_inference_steps 50 \
     --seed 42

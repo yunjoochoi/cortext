@@ -8,10 +8,12 @@
 
 eval "$(conda shell.bash hook)" && conda activate cortext
 cd ~/cortext
+export PYTHONPATH="$PWD:$PYTHONPATH"
 
-
-python dataset/manifest_jsonl.py \
+python dataset/manifest.py \
+    --format jsonl \
     --output /scratch2/shaush/coreset_output/manifest.jsonl \
+    --caption_dir /scratch2/shaush/coreset_output \
     --category_filter "1.간판/1.가로형간판/가로형간판1"
 
 

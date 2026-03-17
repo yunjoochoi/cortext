@@ -57,6 +57,8 @@ from diffusers.utils import convert_unet_state_dict_to_peft
 from diffusers.utils.torch_utils import is_compiled_module
 from transformers import Qwen2Tokenizer, Qwen3Model
 
+from core.utils import build_prompt
+
 logger = get_logger(__name__)
 
 PHASES = ["easy", "medium", "hard"]
@@ -103,13 +105,6 @@ def parse_args():
     return p.parse_args()
 
 
-def build_prompt(caption: str, texts: list) -> str:
-    text_str = ", ".join(texts)
-    if caption:
-        return f"{caption}, texts are written on it: {text_str}"
-    return f"A signage photo, texts are written on it: {text_str}"
-
-
 class CurriculumDataset(Dataset):
     """Loads scored manifest and filters by curriculum tier."""
     ALIGN = 16
@@ -119,7 +114,7 @@ class CurriculumDataset(Dataset):
         with open(scored_manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
-                if not rec.get("text"):
+                if not rec.get("annotations"):
                     continue
                 rec_tier = rec.get("curriculum", {}).get("tier", "")
                 if rec_tier == tier:
@@ -153,10 +148,11 @@ class CurriculumDataset(Dataset):
         if (new_w, new_h) != (orig_w, orig_h):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
-        texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
+        texts = [ann["text"] for ann in rec["annotations"]]
+        pos_idxs = [ann.get("pos") for ann in rec["annotations"]]
         return {
             "pixel_values": self.to_tensor(image),
-            "prompt": build_prompt(rec.get("caption", ""), texts),
+            "prompt": build_prompt(rec.get("caption", ""), texts, pos_idxs),
         }
 
 

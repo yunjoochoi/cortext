@@ -23,4 +23,5 @@ accelerate launch --num_processes 2 training/train_z_image_controlnet_glyph.py \
     --gradient_checkpointing \
     --checkpointing_steps 500 \
     --conditioning_scale 1.0 \
-    --control_layers "0,2,4,6,8"
+    --control_layers "0,2,4,6,8" \
+    --resume_from_checkpoint /scratch2/shaush/training_output/controlnet_glyph/checkpoint-4500

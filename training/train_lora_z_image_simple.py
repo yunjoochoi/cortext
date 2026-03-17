@@ -55,6 +55,8 @@ from diffusers.utils import convert_unet_state_dict_to_peft
 from diffusers.utils.torch_utils import is_compiled_module
 from transformers import Qwen2Tokenizer, Qwen3Model
 
+from core.utils import build_prompt
+
 logger = get_logger(__name__)
 
 
@@ -100,13 +102,6 @@ def parse_args():
     return p.parse_args()
 
 
-def build_prompt(caption: str, texts: list) -> str:
-    text_str = ", ".join(texts)
-    if caption:
-        return f"{caption}, texts are written on it: {text_str}"
-    return f"A signage photo, texts are written on it: {text_str}"
-
-
 # ---------------------------------------------------------------------------
 # Dataset: reads manifest.jsonl, builds prompt from caption + text
 # ---------------------------------------------------------------------------
@@ -118,7 +113,7 @@ class ManifestDataset(Dataset):
         with open(manifest_path) as f:
             for line in f:
                 rec = json.loads(line)
-                if rec.get("text"):
+                if rec.get("annotations"):
                     self.records.append(rec)
         self.max_pixels = max_pixels
         self.to_tensor = transforms.Compose([
@@ -150,10 +145,12 @@ class ManifestDataset(Dataset):
         if (new_w, new_h) != (orig_w, orig_h):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
-        texts = rec["text"] if isinstance(rec["text"], list) else [rec["text"]]
+        texts = [ann["text"] for ann in rec["annotations"]]
+        pos_idxs = [ann.get("pos") for ann in rec["annotations"]]
+        print("검증 in manifestdataset: ",build_prompt(rec.get("caption", ""), texts, pos_idxs))
         return {
             "pixel_values": self.to_tensor(image),
-            "prompt": build_prompt(rec.get("caption", ""), texts),
+            "prompt": build_prompt(rec.get("caption", ""), texts, pos_idxs),
         }
 
 

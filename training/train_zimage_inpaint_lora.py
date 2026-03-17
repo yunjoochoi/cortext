@@ -74,28 +74,25 @@ def expand_patch_embedding(transformer: ZImageTransformer2DModel, extra_channels
 # ---------------------------------------------------------------------------
 
 def build_bbox_mask(
-    bbox: list[int], orig_w: int, orig_h: int,
+    bboxes: list[list[int]], orig_w: int, orig_h: int,
     target_h: int, target_w: int,
 ) -> torch.Tensor:
-    """Pixel bbox [x,y,w,h] -> binary mask [1, H, W] at pixel resolution."""
-    x, y, w, h = bbox
+    """List of pixel bboxes [x,y,w,h] -> union binary mask [1, H, W]."""
     scale_x = target_w / orig_w
     scale_y = target_h / orig_h
-    mx, my = round(x * scale_x), round(y * scale_y)
-    mx2, my2 = round((x + w) * scale_x), round((y + h) * scale_y)
     mask = torch.zeros(1, target_h, target_w)
-    mx, my = max(0, mx), max(0, my)
-    mx2 = min(target_w, mx2)
-    my2 = min(target_h, my2)
-    if mx2 > mx and my2 > my:
-        mask[0, my:my2, mx:mx2] = 1.0
+    for x, y, w, h in bboxes:
+        mx, my = round(x * scale_x), round(y * scale_y)
+        mx2, my2 = round((x + w) * scale_x), round((y + h) * scale_y)
+        mx, my = max(0, mx), max(0, my)
+        mx2 = min(target_w, mx2)
+        my2 = min(target_h, my2)
+        if mx2 > mx and my2 > my:
+            mask[0, my:my2, mx:mx2] = 1.0
     return mask
 
 
-def build_text_prompt(caption: str, text: str) -> str:
-    if not caption:
-        caption = "A photo with Korean text"
-    return f"{caption}, with '{text}' written on it."
+from core.utils import build_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +141,15 @@ class InpaintDataset(torch.utils.data.Dataset):
         pixel_values = np.array(img).astype(np.float32) / 127.5 - 1.0
         pixel_values = torch.from_numpy(pixel_values.transpose(2, 0, 1))  # (3, H, W)
 
-        # Build bbox mask at pixel resolution
-        mask = build_bbox_mask(rec["bbox"], orig_w, orig_h, crop_h, crop_w)  # (1, H, W)
+        anns = rec.get("annotations", [])
+        bboxes = [ann["bbox"] for ann in anns]
+        texts = [ann["text"] for ann in anns]
+        pos_idxs = [ann.get("pos") for ann in anns]
 
-        # Build prompt
-        caption = self.captions.get(rec["image_path"], "")
-        prompt = build_text_prompt(caption, rec["text"])
+        mask = build_bbox_mask(bboxes, orig_w, orig_h, crop_h, crop_w)
+
+        caption = self.captions.get(rec["image_path"], rec.get("caption", ""))
+        prompt = build_prompt(caption, texts, pos_idxs)
 
         return {
             "pixel_values": pixel_values,

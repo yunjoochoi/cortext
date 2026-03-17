@@ -1,13 +1,10 @@
-"""Build unified Parquet manifest from COCO-format label JSONs."""
+"""Build unified manifest from COCO-format label JSONs."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 CATEGORY_MAP = {
     "1.간판/1.가로형간판": "sign/horizontal",
@@ -30,23 +27,6 @@ CATEGORY_MAP = {
     "2.책표지/10.역사": "book/history",
     "2.책표지/11.기타": "book/other",
 }
-
-SCHEMA = pa.schema([
-    ("image_id", pa.string()),
-    ("image", pa.binary()),
-    ("image_width", pa.int32()),
-    ("image_height", pa.int32()),
-    ("category", pa.string()),
-    ("caption", pa.string()),
-    ("annotations", pa.list_(pa.struct([
-        ("text", pa.string()),
-        ("bbox", pa.list_(pa.int32())),
-        ("pos", pa.int32()),
-    ]))),
-    ("metadata", pa.string()),
-    ("model", pa.string()),
-    ("synthetic", pa.bool_()),
-])
 
 
 def map_category(raw_category: str) -> str:
@@ -82,22 +62,46 @@ def is_valid_text(text: str) -> bool:
     return True
 
 
-def build_manifest(
+def compute_pos(bbox: list[int], image_width: int, image_height: int) -> int | None:
+    """Return 0-8 grid position, or None if bbox covers more than half the image."""
+    x, y, w, h = bbox
+    if (w * h) > (image_width * image_height) / 2:
+        return None
+    cx = x + w / 2
+    cy = y + h / 2
+    col = min(int(cx / image_width * 3), 2)
+    row = min(int(cy / image_height * 3), 2)
+    return row * 3 + col
+
+
+def load_caption_lookup(caption_dir: Path, pattern: str = "captions_shard_*_clean.jsonl") -> dict[str, str]:
+    """Build image_path -> clean_caption mapping from caption shard files."""
+    lookup: dict[str, str] = {}
+    for fpath in sorted(caption_dir.glob(pattern)):
+        with open(fpath, encoding="utf-8") as f:
+            for line in f:
+                row = json.loads(line)
+                cap = row.get("clean_caption") or row.get("vlm_caption", "")
+                if cap and row.get("image_path"):
+                    lookup[row["image_path"]] = cap
+    print(f"  Loaded {len(lookup):,} captions from {pattern}")
+    return lookup
+
+
+def _parse_records(
     label_root: Path,
     source_roots: list[Path],
-    output_path: Path,
-    category_filter: str | None = None,
-    batch_size: int = 1000,
+    category_filter: str | None,
+    caption_dir: Path | None,
 ):
+    """Yield (record_dict, image_path) for each valid image."""
     image_lookup = build_image_lookup(source_roots)
+    caption_lookup = load_caption_lookup(caption_dir) if caption_dir else {}
 
     scan_root = label_root / category_filter if category_filter else label_root
     json_files = sorted(scan_root.rglob("*.json"))
     print(f"  {len(json_files):,} label files, {len(image_lookup):,} images")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer: pq.ParquetWriter | None = None
-    batch: list[dict] = []
     stats = {"images": 0, "annotations": 0, "skipped": 0}
 
     for idx, json_path in enumerate(json_files):
@@ -114,15 +118,19 @@ def build_manifest(
             stats["skipped"] += 1
             continue
 
+        img_w = image_info.get("width", 1)
+        img_h = image_info.get("height", 1)
+
         annotations = []
         for ann in data.get("annotations", []):
             text = ann.get("text", "").strip()
             if not is_valid_text(text):
                 continue
+            bbox = ann["bbox"]
             annotations.append({
                 "text": text,
-                "bbox": ann["bbox"],
-                "pos": ann.get("id", 0),
+                "bbox": bbox,
+                "pos": compute_pos(bbox, img_w, img_h),
             })
 
         if not annotations:
@@ -133,49 +141,108 @@ def build_manifest(
         image_id = data.get("info", {}).get("name", image_path.stem)
         meta = data.get("metadata", [{}])
         metadata_dict = meta[0] if meta else {}
+        caption = caption_lookup.get(str(image_path))
 
-        batch.append({
+        record = {
             "image_id": image_id,
-            "image": image_path.read_bytes(),
-            "image_width": image_info.get("width"),
-            "image_height": image_info.get("height"),
+            "image_width": img_w,
+            "image_height": img_h,
             "category": map_category(raw_category),
-            "caption": None,
+            "caption": caption,
             "annotations": annotations,
-            "metadata": json.dumps(metadata_dict, ensure_ascii=False),
+            "metadata": metadata_dict,
             "model": None,
             "synthetic": False,
-        })
+        }
         stats["images"] += 1
         stats["annotations"] += len(annotations)
+        yield record, image_path
+
+    print(f"  {stats['images']:,} images, {stats['annotations']:,} annotations, "
+          f"{stats['skipped']:,} skipped")
+
+
+def write_jsonl(
+    label_root: Path,
+    source_roots: list[Path],
+    output_path: Path,
+    category_filter: str | None = None,
+    caption_dir: Path | None = None,
+):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as out:
+        for record, image_path in _parse_records(label_root, source_roots, category_filter, caption_dir):
+            record["image_path"] = str(image_path)
+            out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+    print(f"  -> {output_path} ({count:,} rows)")
+
+
+def write_parquet(
+    label_root: Path,
+    source_roots: list[Path],
+    output_path: Path,
+    category_filter: str | None = None,
+    caption_dir: Path | None = None,
+    batch_size: int = 1000,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("image_id", pa.string()),
+        ("image", pa.binary()),
+        ("image_width", pa.int32()),
+        ("image_height", pa.int32()),
+        ("category", pa.string()),
+        ("caption", pa.string()),
+        ("annotations", pa.list_(pa.struct([
+            ("text", pa.string()),
+            ("bbox", pa.list_(pa.int32())),
+            ("pos", pa.int32()),
+        ]))),
+        ("metadata", pa.string()),
+        ("model", pa.string()),
+        ("synthetic", pa.bool_()),
+    ])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: pq.ParquetWriter | None = None
+    batch: list[dict] = []
+
+    for record, image_path in _parse_records(label_root, source_roots, category_filter, caption_dir):
+        record["image"] = image_path.read_bytes()
+        record["metadata"] = json.dumps(record["metadata"], ensure_ascii=False)
+        batch.append(record)
 
         if len(batch) >= batch_size:
-            table = pa.Table.from_pylist(batch, schema=SCHEMA)
+            table = pa.Table.from_pylist(batch, schema=schema)
             if writer is None:
-                writer = pq.ParquetWriter(str(output_path), SCHEMA)
+                writer = pq.ParquetWriter(str(output_path), schema)
             writer.write_table(table)
             batch = []
 
     if batch:
-        table = pa.Table.from_pylist(batch, schema=SCHEMA)
+        table = pa.Table.from_pylist(batch, schema=schema)
         if writer is None:
-            writer = pq.ParquetWriter(str(output_path), SCHEMA)
+            writer = pq.ParquetWriter(str(output_path), schema)
         writer.write_table(table)
 
     if writer:
         writer.close()
-
-    print(f"  {stats['images']:,} images, {stats['annotations']:,} annotations, "
-          f"{stats['skipped']:,} skipped -> {output_path}")
+    print(f"  -> {output_path}")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", default="/scratch2/shaush/030.야외_실제_촬영_한글_이미지")
     p.add_argument("--label_subdir", default="[라벨]Training")
-    p.add_argument("--output", default="/scratch2/shaush/coreset_output/manifest.parquet")
+    p.add_argument("--output", default="/scratch2/shaush/coreset_output/manifest.jsonl")
+    p.add_argument("--format", choices=["jsonl", "parquet"], default="jsonl")
     p.add_argument("--category_filter", default=None, help="e.g. '1.간판' to filter")
-    p.add_argument("--batch_size", type=int, default=1000, help="Rows per write batch")
+    p.add_argument("--caption_dir", default=None, help="Dir with captions_shard_*_clean.jsonl")
+    p.add_argument("--batch_size", type=int, default=1000, help="Parquet write batch size")
     args = p.parse_args()
 
     data_root = Path(args.data_root)
@@ -187,10 +254,15 @@ if __name__ == "__main__":
     )
     print(f"  Found {len(source_roots)} source directories")
 
-    build_manifest(
+    common = dict(
         label_root=label_root,
         source_roots=source_roots,
         output_path=Path(args.output),
         category_filter=args.category_filter,
-        batch_size=args.batch_size,
+        caption_dir=Path(args.caption_dir) if args.caption_dir else None,
     )
+
+    if args.format == "jsonl":
+        write_jsonl(**common)
+    else:
+        write_parquet(**common, batch_size=args.batch_size)
