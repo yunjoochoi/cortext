@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors.torch import load_file as load_safetensors
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -45,17 +46,34 @@ FONT_PATH = str(Path(__file__).resolve().parent.parent / "NotoSansKR-VariableFon
 # ---------------------------------------------------------------------------
 # Glyph rendering
 # ---------------------------------------------------------------------------
+
+def _insert_spaces(text: str, n: int) -> str:
+    if n == 0:
+        return text
+    spaced = ""
+    for ch in text:
+        spaced += ch + " " * n
+    return spaced[:-n]
+
+
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
+    _, _, tw, th = draw.textbbox(xy=(0, 0), text=text, font=font)
+    return max(tw, 1), max(th, 1)
+
+
 def render_glyph_canvas(
     img_w: int, img_h: int,
     bboxes: list, texts: list,
     font_path: str = FONT_PATH,
 ) -> Image.Image:
-    """Render text glyphs at bbox positions on a black canvas.
-
-    Horizontal text if bbox w >= h, vertical text if h > w.
-    """
+    """Render text glyphs at bbox positions on a black canvas."""
     canvas = Image.new("RGB", (img_w, img_h), (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
+
+    try:
+        base_font = ImageFont.truetype(font_path, 50)
+    except OSError:
+        base_font = ImageFont.load_default()
 
     for bbox, text in zip(bboxes, texts):
         x, y, bw, bh = bbox
@@ -65,14 +83,10 @@ def render_glyph_canvas(
         is_vertical = bh > bw
 
         if is_vertical:
-            # Vertical: render each char top-to-bottom
             n_chars = len(text)
             char_h = bh / n_chars
-            font_size = max(int(min(bw, char_h) * 0.85), 8)
-            try:
-                font = ImageFont.truetype(font_path, font_size)
-            except OSError:
-                font = ImageFont.load_default()
+            font_size = max(int(min(bw, char_h) * 0.80), 8)
+            font = base_font.font_variant(size=font_size)
 
             for i, ch in enumerate(text):
                 bx0, by0, bx1, by1 = font.getbbox(ch)
@@ -81,27 +95,29 @@ def render_glyph_canvas(
                 cy = y + i * char_h + (char_h - ch_h) / 2 - by0
                 draw.text((cx, cy), ch, fill=(255, 255, 255), font=font)
         else:
-            # Horizontal: render text fitting bbox width
-            font_size = max(int(bh * 0.85), 8)
-            try:
-                font = ImageFont.truetype(font_path, font_size)
-            except OSError:
-                font = ImageFont.load_default()
+            # Aspect-ratio-based font sizing (AnyText style)
+            probe_tw, probe_th = _measure_text(draw, text, base_font)
+            text_w_at_bh = bh * (probe_tw / probe_th)
 
-            # Scale font to fit width
-            bx0, by0, bx1, by1 = font.getbbox(text)
-            text_w = bx1 - bx0
-            if text_w > bw and text_w > 0:
-                font_size = max(int(font_size * bw / text_w), 8)
-                try:
-                    font = ImageFont.truetype(font_path, font_size)
-                except OSError:
-                    font = ImageFont.load_default()
-                bx0, by0, bx1, by1 = font.getbbox(text)
+            if text_w_at_bh <= bw:
+                # Text fits — insert spaces to fill bbox width
+                if len(text) > 1:
+                    for i in range(1, 100):
+                        spaced = _insert_spaces(text, i)
+                        sw, sh = _measure_text(draw, spaced, base_font)
+                        if bh * (sw / sh) > bw:
+                            break
+                    text = _insert_spaces(text, i - 1)
+                font_size = max(int(bh * 0.80), 8)
+            else:
+                # Text wider than bbox — shrink to fit
+                font_size = max(int(bh / (text_w_at_bh / bw) * 0.85), 8)
 
-            text_w, text_h = bx1 - bx0, by1 - by0
-            tx = x + (bw - text_w) / 2 - bx0
-            ty = y + (bh - text_h) / 2 - by0
+            font = base_font.font_variant(size=font_size)
+            left, top, right, bottom = font.getbbox(text)
+            text_w, text_h = right - left, bottom - top
+            tx = x + (bw - text_w) / 2 - left
+            ty = y + (bh - text_h) / 2 - top
             draw.text((tx, ty), text, fill=(255, 255, 255), font=font)
 
     return canvas
@@ -358,9 +374,9 @@ def main():
         return m._orig_mod if is_compiled_module(m) else m
 
     def save_hook(models, weights, output_dir):
+        if weights:
+            weights.pop()
         if accelerator.is_main_process:
-            if weights:
-                weights.pop()
             unwrap(controlnet).save_pretrained(os.path.join(output_dir, "controlnet"))
 
     def load_hook(models, input_dir):
@@ -368,8 +384,8 @@ def main():
             models.pop()
         cn_path = os.path.join(input_dir, "controlnet")
         if os.path.exists(cn_path):
-            cn_state = torch.load(os.path.join(cn_path, "diffusion_pytorch_model.safetensors"),
-                                  map_location="cpu")
+            cn_state = load_safetensors(os.path.join(cn_path, "diffusion_pytorch_model.safetensors"),
+                                       device="cpu")
             unwrap(controlnet).load_state_dict(cn_state, strict=False)
 
     accelerator.register_save_state_pre_hook(save_hook)

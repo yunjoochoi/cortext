@@ -11,8 +11,8 @@ cd ~/cortext
 
 python training/infer_lora_z_image_simple.py \
     --model_path /scratch2/shaush/models/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021 \
-    --training_dir /scratch2/shaush/training_output/lora_repa \
-    --output_dir /scratch2/shaush/training_output/lora_repa/infer_results \
+    --training_dir /scratch2/shaush/training_output/lora_repa_enhanced_captions \
+    --output_dir /scratch2/shaush/training_output/lora_repa_enhanced_captions/infer_results \
     --prompt \
         "A close-up of a blue horizontal sign mounted on a beige concrete building under soft afternoon light, with the words of '카페라떼' located at center." \
         "A wide shot of a Korean restaurant storefront with warm yellow lighting and a red awning at dusk, textual material depicted in the image are '닭볶음탕' placed on center." \

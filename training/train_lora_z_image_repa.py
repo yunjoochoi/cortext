@@ -460,10 +460,10 @@ def main():
         return m._orig_mod if is_compiled_module(m) else m
 
     def save_hook(models, weights, output_dir):
+        if weights:
+            weights.pop()
         if accelerator.is_main_process:
             lora_layers = get_peft_model_state_dict(unwrap(transformer))
-            if weights:
-                weights.pop()
             ZImagePipeline.save_lora_weights(
                 output_dir, transformer_lora_layers=lora_layers,
                 **_collate_lora_metadata({"transformer": unwrap(transformer)}))

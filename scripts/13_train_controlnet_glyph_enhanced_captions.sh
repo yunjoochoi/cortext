@@ -22,6 +22,7 @@ accelerate launch --num_processes 2 training/train_z_image_controlnet_glyph.py \
     --mixed_precision bf16 \
     --gradient_checkpointing \
     --checkpointing_steps 500 \
+    --resume_from_checkpoint latest \
     --conditioning_scale 1.0 \
     --control_layers "0,6,12,18,24"
 # 캡션증강+ 균등분산버전
