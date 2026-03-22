@@ -59,8 +59,13 @@ def main():
     for ckpt_path in checkpoints:
         ckpt_name = ckpt_path.name if ckpt_path != training_dir else "final"
         ckpt_output = output_dir / ckpt_name
-        ckpt_output.mkdir(parents=True, exist_ok=True)
 
+        expected = {ckpt_output / f"{i:04d}.png" for i in range(len(args.prompt))}
+        if expected and all(p.exists() for p in expected):
+            print(f"\n=== {ckpt_name} === SKIP (already done)")
+            continue
+
+        ckpt_output.mkdir(parents=True, exist_ok=True)
         print(f"\n=== {ckpt_name} ===")
         pipe.load_lora_weights(ckpt_path)
 
