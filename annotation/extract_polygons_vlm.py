@@ -31,14 +31,14 @@ SYSTEM_PROMPT = (
 
 
 def build_user_prompt(annotations: list[dict], img_w: int, img_h: int) -> str:
-    lines = [f"Image size: {img_w}x{img_h}px. Refine these {len(annotations)} text regions:\n"]
+    n = len(annotations)
+    lines = [f"Image size: {img_w}x{img_h}px. Locate these {n} text strings in the image:\n"]
     for i, ann in enumerate(annotations):
-        x, y, w, h = ann["bbox"]
-        x2, y2 = x + w, y + h
-        lines.append(f"{i+1}. Text: '{ann['text']}' — approx bbox: [{int(x)},{int(y)},{int(x2)},{int(y2)}]")
+        lines.append(f"{i+1}. '{ann['text']}'")
     lines.append(
-        "\nFor each region, output a tight 4-point polygon [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in pixel coords. "
-        "Return a JSON array of exactly {n} polygons.".format(n=len(annotations))
+        f"\nFor each text, output a tight 4-point polygon [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in pixel coords "
+        "that wraps the actual text stroke boundaries, following any slant or rotation. "
+        f"Return a JSON array of exactly {n} polygons in the same order."
     )
     return "\n".join(lines)
 
