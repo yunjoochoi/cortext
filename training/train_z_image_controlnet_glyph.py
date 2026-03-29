@@ -420,8 +420,8 @@ def main():
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    # ---- Save debug glyph pairs (first 10 samples) ----
-    if accelerator.is_main_process:
+    # ---- Save debug glyph pairs (first 10 samples, fresh start only) ----
+    if accelerator.is_main_process and global_step == 0:
         debug_dir = Path(args.output_dir) / "debug_glyph"
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_count = 0
@@ -444,6 +444,8 @@ def main():
                 combined.save(debug_dir / f"{debug_count:04d}.jpg")
                 debug_count += 1
         logger.info(f"Saved {debug_count} debug glyph pairs to {debug_dir}")
+
+    accelerator.wait_for_everyone()
 
     # ---- Training loop ----
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -520,8 +522,8 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
-                    if args.checkpoints_total_limit is not None:
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process and args.checkpoints_total_limit is not None:
                         ckpts = sorted(
                             [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
                             key=lambda x: int(x.split("-")[1]))

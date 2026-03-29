@@ -1,4 +1,4 @@
-"""Z-Image ControlNet fine-tuning with glyph conditioning and bbox-masked loss."""
+"""Z-Image ControlNet glyph fine-tuning with 3-phase curriculum and bbox-masked loss."""
 
 import argparse
 import copy
@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import random
 import shutil
 from pathlib import Path
 
@@ -40,6 +39,7 @@ from core.utils import build_prompt
 
 logger = get_logger(__name__)
 
+PHASES = ["easy", "medium", "hard"]
 VAE_SCALE_FACTOR = 8
 FONT_PATH = str(Path(__file__).resolve().parent.parent / "NotoSansKR-VariableFont_wght.ttf")
 
@@ -66,7 +66,6 @@ def render_glyph_canvas(
     bboxes: list, texts: list,
     font_path: str = FONT_PATH,
 ) -> Image.Image:
-    """Render text glyphs at bbox positions on a black canvas."""
     canvas = Image.new("RGB", (img_w, img_h), (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
@@ -95,12 +94,10 @@ def render_glyph_canvas(
                 cy = y + i * char_h + (char_h - ch_h) / 2 - by0
                 draw.text((cx, cy), ch, fill=(255, 255, 255), font=font)
         else:
-            # Aspect-ratio-based font sizing (AnyText style)
             probe_tw, probe_th = _measure_text(draw, text, base_font)
             text_w_at_bh = bh * (probe_tw / probe_th)
 
             if text_w_at_bh <= bw:
-                # Text fits — insert spaces to fill bbox width
                 if len(text) > 1:
                     for i in range(1, 100):
                         spaced = _insert_spaces(text, i)
@@ -110,7 +107,6 @@ def render_glyph_canvas(
                     text = _insert_spaces(text, i - 1)
                 font_size = max(int(bh * 0.80), 8)
             else:
-                # Text wider than bbox — shrink to fit
                 font_size = max(int(bh / (text_w_at_bh / bw) * 0.85), 8)
 
             font = base_font.font_variant(size=font_size)
@@ -128,7 +124,6 @@ def render_glyph_canvas(
 # ---------------------------------------------------------------------------
 
 def build_latent_mask(bboxes: list, img_size: tuple, device: torch.device) -> torch.Tensor:
-    """Build a binary mask in latent space from pixel-space COCO bboxes [x,y,w,h]."""
     h, w = img_size
     lh, lw = h // VAE_SCALE_FACTOR, w // VAE_SCALE_FACTOR
     mask = torch.zeros(1, 1, lh, lw, device=device)
@@ -142,18 +137,45 @@ def build_latent_mask(bboxes: list, img_size: tuple, device: torch.device) -> to
 
 
 # ---------------------------------------------------------------------------
+# Curriculum tier assignment
+# ---------------------------------------------------------------------------
+
+def assign_tiers(records: list[dict]) -> dict[str, list[dict]]:
+    scored = []
+    for rec in records:
+        score = sum(ann.get("difficulty", 0.0) for ann in rec.get("annotations", []))
+        scored.append((score, rec))
+    scored.sort(key=lambda x: x[0])
+
+    n = len(scored)
+    b1, b2 = n // 3, 2 * n // 3
+    tier_map = {"easy": [], "medium": [], "hard": []}
+    for i, (score, rec) in enumerate(scored):
+        if i < b1:
+            tier_map["easy"].append(rec)
+        elif i < b2:
+            tier_map["medium"].append(rec)
+        else:
+            tier_map["hard"].append(rec)
+
+    for tier, recs in tier_map.items():
+        logger.info(f"  Tier {tier}: {len(recs):,} images")
+    return tier_map
+
+
+# ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     p.add_argument("--manifest", type=str, required=True)
-    p.add_argument("--output_dir", type=str, default="z-image-controlnet-glyph-masked")
+    p.add_argument("--output_dir", type=str, default="z-image-controlnet-glyph-curriculum-masked")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max_pixels", type=int, default=1024*1024)
+    p.add_argument("--max_pixels", type=int, default=1024 * 1024)
     p.add_argument("--train_batch_size", type=int, default=1)
-    p.add_argument("--num_train_epochs", type=int, default=1)
-    p.add_argument("--max_train_steps", type=int, default=None)
+    p.add_argument("--steps_per_phase", type=int, default=6250)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--learning_rate", type=float, default=1e-4)
@@ -165,7 +187,6 @@ def parse_args():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--checkpointing_steps", type=int, default=500)
     p.add_argument("--checkpoints_total_limit", type=int, default=10)
-    p.add_argument("--resume_from_checkpoint", type=str, default=None)
     p.add_argument("--allow_tf32", action="store_true")
     p.add_argument("--report_to", type=str, default="tensorboard")
     p.add_argument("--logging_dir", type=str, default="logs")
@@ -175,31 +196,23 @@ def parse_args():
     p.add_argument("--logit_std", type=float, default=1.0)
     p.add_argument("--mode_scale", type=float, default=1.29)
     p.add_argument("--conditioning_scale", type=float, default=1.0)
-    p.add_argument("--validation_prompt", type=str, default=None)
-    p.add_argument("--validation_epochs", type=int, default=50)
-    p.add_argument("--num_validation_images", type=int, default=4)
     p.add_argument("--use_8bit_adam", action="store_true")
     p.add_argument("--font_path", type=str, default=FONT_PATH)
-    # ControlNet config
-    p.add_argument("--control_layers", type=str, default="0,2,4",
-                   help="Comma-separated layer indices for ControlNet")
+    p.add_argument("--control_layers", type=str, default="0,15,20,24,28")
+    p.add_argument("--phases", nargs="+", choices=PHASES, default=PHASES)
+    p.add_argument("--resume_from_checkpoint", type=str, default=None)
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-class ManifestDataset(Dataset):
+
+class GlyphCurriculumDataset(Dataset):
     ALIGN = 16
 
-    def __init__(self, manifest_path: str, max_pixels: int = 1024 * 1024, font_path: str = FONT_PATH):
-        self.records = []
-        with open(manifest_path) as f:
-            for line in f:
-                rec = json.loads(line)
-                anns = rec.get("annotations", [])
-                if anns:
-                    self.records.append(rec)
+    def __init__(self, records: list[dict], max_pixels: int = 1024 * 1024, font_path: str = FONT_PATH):
+        self.records = records
         self.max_pixels = max_pixels
         self.font_path = font_path
         self.to_tensor = transforms.Compose([
@@ -219,12 +232,6 @@ class ManifestDataset(Dataset):
         return max(self.ALIGN, w), max(self.ALIGN, h)
 
     def __getitem__(self, idx):
-        try:
-            return self._load(idx)
-        except OSError:
-            return self._load(random.randint(0, len(self.records) - 1))
-
-    def _load(self, idx):
         rec = self.records[idx]
         image = Image.open(rec["image_path"])
         image = exif_transpose(image)
@@ -237,17 +244,14 @@ class ManifestDataset(Dataset):
             image = image.resize((new_w, new_h), Image.BILINEAR)
 
         sx, sy = new_w / orig_w, new_h / orig_h
-        bboxes = []
-        texts = []
-        pos_idxs = []
+        bboxes, texts, pos_idxs = [], [], []
         for ann in rec.get("annotations", []):
             x, y, w, h = ann["bbox"]
             bboxes.append([x * sx, y * sy, w * sx, h * sy])
             texts.append(ann["text"])
             pos_idxs.append(ann.get("pos"))
 
-        glyph_canvas = render_glyph_canvas(
-            new_w, new_h, bboxes, texts, self.font_path)
+        glyph_canvas = render_glyph_canvas(new_w, new_h, bboxes, texts, self.font_path)
 
         return {
             "pixel_values": self.to_tensor(image),
@@ -273,8 +277,186 @@ def collate_fn(examples):
 
 
 # ---------------------------------------------------------------------------
+# Phase training
+# ---------------------------------------------------------------------------
+
+def train_phase(
+    phase_name: str,
+    records: list[dict],
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    controlnet,
+    transformer,
+    vae,
+    noise_scheduler_copy,
+    encode_prompts,
+    weight_dtype,
+    global_step: int,
+    resume_phase_step: int = 0,
+) -> int:
+    phase_dir = os.path.join(args.output_dir, phase_name)
+    if accelerator.is_main_process:
+        os.makedirs(phase_dir, exist_ok=True)
+
+    if not records:
+        logger.warning(f"[{phase_name}] No samples, skipping")
+        return global_step
+
+    train_dataset = GlyphCurriculumDataset(records, args.max_pixels, args.font_path)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.train_batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=args.dataloader_num_workers, drop_last=True,
+    )
+    logger.info(f"[{phase_name}] {len(train_dataset):,} samples")
+
+    controlnet_params = list(filter(lambda p: p.requires_grad, controlnet.parameters()))
+    if args.use_8bit_adam:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(controlnet_params, lr=args.learning_rate, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.AdamW(controlnet_params, lr=args.learning_rate, weight_decay=1e-4)
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler, optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.steps_per_phase * args.gradient_accumulation_steps,
+    )
+
+    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        optimizer, train_dataloader, lr_scheduler)
+
+    vae_shift = vae.config.shift_factor
+    vae_scale = vae.config.scaling_factor
+
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    phase_step = resume_phase_step
+    progress_bar = tqdm(range(args.steps_per_phase), initial=phase_step, desc=f"[{phase_name}]",
+                        disable=not accelerator.is_local_main_process)
+
+    remaining = args.steps_per_phase - phase_step
+    steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_epochs = math.ceil(remaining / steps_per_epoch) if steps_per_epoch > 0 else 0
+
+    def unwrap(model):
+        m = accelerator.unwrap_model(model)
+        return m._orig_mod if is_compiled_module(m) else m
+
+    for epoch in range(num_epochs):
+        transformer.eval()
+        controlnet.train()
+        for batch in train_dataloader:
+            with accelerator.accumulate(controlnet):
+                with torch.no_grad():
+                    prompt_embeds = encode_prompts(batch["prompts"])
+                    pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                    model_input = vae.encode(pv).latent_dist.mode()
+                    gv = batch["glyph_values"].to(accelerator.device, dtype=vae.dtype)
+                    glyph_latent = vae.encode(gv).latent_dist.mode()
+
+                model_input = (model_input - vae_shift) * vae_scale
+                glyph_latent = (glyph_latent - vae_shift) * vae_scale
+                noise = torch.randn_like(model_input)
+                bsz = model_input.shape[0]
+
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme, batch_size=bsz,
+                    logit_mean=args.logit_mean, logit_std=args.logit_std, mode_scale=args.mode_scale)
+                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                timestep_normalized = (1000 - timesteps) / 1000
+
+                noisy_list = list(noisy_model_input.unsqueeze(2).unbind(dim=0))
+                glyph_list = list(glyph_latent.unsqueeze(2).unbind(dim=0))
+
+                controlnet_block_samples = controlnet(
+                    x=noisy_list, t=timestep_normalized, cap_feats=prompt_embeds,
+                    control_context=glyph_list, conditioning_scale=args.conditioning_scale,
+                )
+                controlnet_block_samples = {
+                    k: v.to(dtype=weight_dtype) for k, v in controlnet_block_samples.items()
+                }
+
+                model_pred_list = transformer(
+                    noisy_list, timestep_normalized, prompt_embeds,
+                    controlnet_block_samples=controlnet_block_samples,
+                    return_dict=False,
+                )[0]
+                model_pred = torch.stack(model_pred_list, dim=0).squeeze(2)
+                model_pred = -model_pred
+
+                # Bbox masks in latent space
+                masks = torch.cat([
+                    build_latent_mask(batch["bboxes"][i], batch["img_sizes"][i], model_input.device)
+                    for i in range(bsz)
+                ], dim=0)
+
+                # Masked loss (text regions only)
+                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                target = noise - model_input
+                per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
+                masked_loss = per_pixel_loss * masks.float()
+                n_channels = model_input.shape[1]
+                mask_sums = masks.reshape(bsz, -1).sum(dim=1) * n_channels
+                mask_sums = mask_sums.clamp(min=1.0)
+                loss = (masked_loss.reshape(bsz, -1).sum(dim=1) / mask_sums).mean()
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(controlnet_params, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                phase_step += 1
+                global_step += 1
+
+                if accelerator.is_main_process and phase_step % args.checkpointing_steps == 0:
+                    ckpt_dir = os.path.join(phase_dir, f"checkpoint-{phase_step}")
+                    if args.checkpoints_total_limit is not None:
+                        ckpts = sorted(
+                            [d for d in os.listdir(phase_dir) if d.startswith("checkpoint")],
+                            key=lambda x: int(x.split("-")[1]))
+                        while len(ckpts) >= args.checkpoints_total_limit:
+                            shutil.rmtree(os.path.join(phase_dir, ckpts.pop(0)))
+                    accelerator.save_state(ckpt_dir)
+                    with open(os.path.join(ckpt_dir, "curriculum_state.json"), "w") as f:
+                        json.dump({"phase": phase_name, "phase_step": phase_step, "global_step": global_step}, f)
+                    logger.info(f"[{phase_name}] Saved checkpoint-{phase_step}")
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "phase": phase_name}
+            progress_bar.set_postfix(loss=logs["loss"], lr=logs["lr"])
+            accelerator.log(logs, step=global_step)
+
+            if phase_step >= args.steps_per_phase:
+                break
+        if phase_step >= args.steps_per_phase:
+            break
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrap(controlnet).save_pretrained(os.path.join(phase_dir, "controlnet"))
+        logger.info(f"[{phase_name}] ControlNet saved to {phase_dir}/controlnet")
+
+    return global_step
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 def main():
     args = parse_args()
 
@@ -306,9 +488,6 @@ def main():
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-    vae_shift = vae.config.shift_factor
-    vae_scale = vae.config.scaling_factor
-
     transformer = ZImageTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype)
     text_encoder = Qwen3Model.from_pretrained(
@@ -326,8 +505,8 @@ def main():
     control_layers = [int(x) for x in args.control_layers.split(",")]
     controlnet = ZImageControlNetModel(
         control_layers_places=control_layers,
-        control_in_dim=vae.config.latent_channels,  # 16
-        dim=transformer.config["dim"],  # 3840
+        control_in_dim=vae.config.latent_channels,
+        dim=transformer.config["dim"],
         n_heads=transformer.config["n_heads"],
         n_kv_heads=transformer.config["n_kv_heads"],
         n_refiner_layers=transformer.config["n_refiner_layers"],
@@ -337,12 +516,10 @@ def main():
     controlnet.train()
     if args.gradient_checkpointing:
         controlnet.enable_gradient_checkpointing()
-    logger.info(f"ControlNet initialized: control_layers={control_layers}, "
-                f"params={sum(p.numel() for p in controlnet.parameters() if p.requires_grad):,}")
-
-    transformer.requires_grad_(False)
-    if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
+
+    logger.info(f"ControlNet: layers={control_layers}, "
+                f"trainable params={sum(p.numel() for p in controlnet.parameters() if p.requires_grad):,}")
 
     # ---- Text encoding pipeline ----
     text_encoding_pipeline = ZImagePipeline(
@@ -359,48 +536,14 @@ def main():
             )
         return prompt_embeds
 
-    # ---- Dataset & DataLoader ----
-    train_dataset = ManifestDataset(args.manifest, args.max_pixels, args.font_path)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=args.dataloader_num_workers, drop_last=True,
-    )
-    logger.info(f"Dataset: {len(train_dataset):,} samples")
+    # ---- Prepare ControlNet ----
+    controlnet = accelerator.prepare(controlnet)
 
-    # ---- Optimizer (ControlNet only) ----
-    controlnet_params = list(filter(lambda p: p.requires_grad, controlnet.parameters()))
-
-    optimizer = torch.optim.AdamW(controlnet_params, lr=args.learning_rate, weight_decay=1e-4)
-
-    logger.info(f"Trainable ControlNet params: {sum(p.numel() for p in controlnet_params):,}")
-
-    # ---- LR scheduler ----
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler, optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
-
-    # ---- Accelerate prepare ----
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler)
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-
-    if accelerator.is_main_process:
-        accelerator.init_trackers("z-image-controlnet-glyph-masked", config=vars(args))
-    if args.allow_tf32 and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-    # ---- Save/Load hooks ----
     def unwrap(model):
         m = accelerator.unwrap_model(model)
         return m._orig_mod if is_compiled_module(m) else m
 
+    # ---- Save/Load hooks ----
     def save_hook(models, weights, output_dir):
         if weights:
             weights.pop()
@@ -412,163 +555,87 @@ def main():
             models.pop()
         cn_path = os.path.join(input_dir, "controlnet")
         if os.path.exists(cn_path):
-            cn_state = load_safetensors(os.path.join(cn_path, "diffusion_pytorch_model.safetensors"),
-                                       device="cpu")
+            cn_state = load_safetensors(
+                os.path.join(cn_path, "diffusion_pytorch_model.safetensors"), device="cpu")
             unwrap(controlnet).load_state_dict(cn_state, strict=False)
 
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
 
+    if accelerator.is_main_process:
+        accelerator.init_trackers("z-image-controlnet-glyph-curriculum-masked", config=vars(args))
+    if args.allow_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ---- Load manifest and assign curriculum tiers ----
+    all_records = []
+    with open(args.manifest) as f:
+        for line in f:
+            rec = json.loads(line)
+            if rec.get("annotations"):
+                all_records.append(rec)
+    logger.info(f"Loaded {len(all_records):,} records from manifest")
+    tier_records = assign_tiers(all_records)
+
     # ---- Resume ----
     global_step = 0
-    first_epoch = 0
+    resume_phase = None
+    resume_phase_step = 0
+
     if args.resume_from_checkpoint:
-        path = args.resume_from_checkpoint
-        if path == "latest":
-            dirs = sorted(
-                [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
-                key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if dirs else None
-        if path:
-            accelerator.print(f"Resuming from {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-            first_epoch = global_step // num_update_steps_per_epoch
+        ckpt_path = args.resume_from_checkpoint
+        if ckpt_path == "latest":
+            latest_ckpt = None
+            latest_global = -1
+            for p_name in PHASES:
+                p_dir = os.path.join(args.output_dir, p_name)
+                if not os.path.isdir(p_dir):
+                    continue
+                for d in os.listdir(p_dir):
+                    state_file = os.path.join(p_dir, d, "curriculum_state.json")
+                    if os.path.exists(state_file):
+                        with open(state_file) as f:
+                            state = json.load(f)
+                        if state["global_step"] > latest_global:
+                            latest_global = state["global_step"]
+                            latest_ckpt = os.path.join(p_dir, d)
+            ckpt_path = latest_ckpt
 
-    progress_bar = tqdm(range(args.max_train_steps), initial=global_step, desc="Steps",
-                        disable=not accelerator.is_local_main_process)
+        if ckpt_path:
+            state_file = os.path.join(ckpt_path, "curriculum_state.json")
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    state = json.load(f)
+                resume_phase = state["phase"]
+                resume_phase_step = state["phase_step"]
+                global_step = state["global_step"]
+            accelerator.load_state(ckpt_path)
+            logger.info(f"Resumed from {ckpt_path}: phase={resume_phase}, "
+                        f"phase_step={resume_phase_step}, global_step={global_step}")
 
-    # ---- Sigma helper ----
-    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
-        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
+    # ---- Run phases ----
+    skip = resume_phase is not None
+    for phase_name in args.phases:
+        if skip:
+            if phase_name != resume_phase:
+                logger.info(f"Skipping completed phase: {phase_name}")
+                continue
+            skip = False
 
-    # ---- Save debug glyph pairs (first 10 samples, raw dataset — no DDP sync needed) ----
-    if accelerator.is_main_process:
-        debug_dir = Path(args.output_dir) / "debug_glyph"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(min(10, len(train_dataset))):
-            sample = train_dataset[i]
-            gt_pil = transforms.ToPILImage()(sample["pixel_values"] * 0.5 + 0.5)
-            gl_pil = transforms.ToPILImage()(sample["glyph_values"] * 0.5 + 0.5)
-            w, h = gt_pil.size
-            combined = Image.new("RGB", (w * 2, h))
-            combined.paste(gt_pil, (0, 0))
-            combined.paste(gl_pil, (w, 0))
-            combined.save(debug_dir / f"{i:04d}.jpg")
-        logger.info(f"Saved {min(10, len(train_dataset))} debug glyph pairs to {debug_dir}")
-
-    # ---- Training loop ----
-    for _epoch in range(first_epoch, args.num_train_epochs):
-        transformer.eval()
-        controlnet.train()
-        for batch in train_dataloader:
-            with accelerator.accumulate(controlnet):
-                with torch.no_grad():
-                    prompt_embeds = encode_prompts(batch["prompts"])
-                    pv = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
-                    model_input = vae.encode(pv).latent_dist.mode()
-                    gv = batch["glyph_values"].to(accelerator.device, dtype=vae.dtype)
-                    glyph_latent = vae.encode(gv).latent_dist.mode()
-
-                model_input = (model_input - vae_shift) * vae_scale
-                glyph_latent = (glyph_latent - vae_shift) * vae_scale
-                noise = torch.randn_like(model_input)
-                bsz = model_input.shape[0]
-
-                # Timestep sampling
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=args.weighting_scheme, batch_size=bsz,
-                    logit_mean=args.logit_mean, logit_std=args.logit_std, mode_scale=args.mode_scale)
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
-
-                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
-                timestep_normalized = (1000 - timesteps) / 1000
-
-                # Z-Image expects List[Tensor(C,1,H,W)]
-                noisy_list = list(noisy_model_input.unsqueeze(2).unbind(dim=0))
-                glyph_list = list(glyph_latent.unsqueeze(2).unbind(dim=0))
-
-                # ControlNet forward
-                controlnet_block_samples = controlnet(
-                    x=noisy_list,
-                    t=timestep_normalized,
-                    cap_feats=prompt_embeds,
-                    control_context=glyph_list,
-                    conditioning_scale=args.conditioning_scale,
-                )
-
-                # Cast ControlNet outputs to match frozen transformer dtype
-                controlnet_block_samples = {
-                    k: v.to(dtype=weight_dtype) for k, v in controlnet_block_samples.items()
-                }
-
-                # Transformer forward with ControlNet residuals
-                model_pred_list = transformer(
-                    noisy_list, timestep_normalized, prompt_embeds,
-                    controlnet_block_samples=controlnet_block_samples,
-                    return_dict=False,
-                )[0]
-                model_pred = torch.stack(model_pred_list, dim=0).squeeze(2)
-                model_pred = -model_pred
-
-                # Bbox masks in latent space: (B, 1, lH, lW)
-                masks = torch.cat([
-                    build_latent_mask(batch["bboxes"][i], batch["img_sizes"][i], model_input.device)
-                    for i in range(bsz)
-                ], dim=0)
-
-                # Masked loss (text regions only)
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
-                target = noise - model_input
-                per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
-                masked_loss = per_pixel_loss * masks.float()
-                n_channels = model_input.shape[1]
-                mask_sums = masks.reshape(bsz, -1).sum(dim=1) * n_channels
-                mask_sums = mask_sums.clamp(min=1.0)
-                loss = (masked_loss.reshape(bsz, -1).sum(dim=1) / mask_sums).mean()
-
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(controlnet_params, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process and args.checkpoints_total_limit is not None:
-                        ckpts = sorted(
-                            [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
-                            key=lambda x: int(x.split("-")[1]))
-                        while len(ckpts) >= args.checkpoints_total_limit:
-                            shutil.rmtree(os.path.join(args.output_dir, ckpts.pop(0)))
-                    accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
-                    if accelerator.is_main_process:
-                        logger.info(f"Saved checkpoint-{global_step}")
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
-
-            if global_step >= args.max_train_steps:
-                break
+        phase_resume_step = resume_phase_step if phase_name == resume_phase else 0
+        logger.info(f"\n{'='*60}\nPhase: {phase_name} ({len(tier_records[phase_name]):,} samples)\n{'='*60}")
+        global_step = train_phase(
+            phase_name, tier_records[phase_name], args, accelerator,
+            controlnet, transformer, vae, noise_scheduler_copy,
+            encode_prompts, weight_dtype, global_step,
+            resume_phase_step=phase_resume_step,
+        )
 
     # ---- Final save ----
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unwrap(controlnet).save_pretrained(os.path.join(args.output_dir, "controlnet"))
-        logger.info(f"ControlNet saved to {args.output_dir}")
+        logger.info(f"Final ControlNet saved to {args.output_dir}/controlnet")
 
     accelerator.end_training()
 
