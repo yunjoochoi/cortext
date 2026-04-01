@@ -141,6 +141,7 @@ def build_latent_mask(bboxes: list, img_size: tuple, device: torch.device) -> to
 # ---------------------------------------------------------------------------
 
 def assign_tiers(records: list[dict]) -> dict[str, list[dict]]:
+    """Compute image-level difficulty and split by quartiles (Q1/Q3)."""
     scored = []
     for rec in records:
         score = sum(ann.get("difficulty", 0.0) for ann in rec.get("annotations", []))
@@ -148,15 +149,18 @@ def assign_tiers(records: list[dict]) -> dict[str, list[dict]]:
     scored.sort(key=lambda x: x[0])
 
     n = len(scored)
-    b1, b2 = n // 3, 2 * n // 3
+    q1_idx, q3_idx = n // 4, 3 * n // 4
+    q1_val = scored[q1_idx][0]
+    q3_val = scored[q3_idx][0]
+
     tier_map = {"easy": [], "medium": [], "hard": []}
-    for i, (score, rec) in enumerate(scored):
-        if i < b1:
+    for score, rec in scored:
+        if score < q1_val:
             tier_map["easy"].append(rec)
-        elif i < b2:
-            tier_map["medium"].append(rec)
-        else:
+        elif score > q3_val:
             tier_map["hard"].append(rec)
+        else:
+            tier_map["medium"].append(rec)
 
     for tier, recs in tier_map.items():
         logger.info(f"  Tier {tier}: {len(recs):,} images")
@@ -175,7 +179,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_pixels", type=int, default=1024 * 1024)
     p.add_argument("--train_batch_size", type=int, default=1)
-    p.add_argument("--steps_per_phase", type=int, default=6250)
+    p.add_argument("--epochs_per_phase", type=int, default=3)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--learning_rate", type=float, default=1e-4)
@@ -292,6 +296,7 @@ def train_phase(
     encode_prompts,
     weight_dtype,
     global_step: int,
+    phase_steps: int,
     resume_phase_step: int = 0,
 ) -> int:
     phase_dir = os.path.join(args.output_dir, phase_name)
@@ -319,7 +324,7 @@ def train_phase(
     lr_scheduler = get_scheduler(
         args.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.steps_per_phase * args.gradient_accumulation_steps,
+        num_training_steps=phase_steps * args.gradient_accumulation_steps,
     )
 
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -338,10 +343,10 @@ def train_phase(
         return sigma
 
     phase_step = resume_phase_step
-    progress_bar = tqdm(range(args.steps_per_phase), initial=phase_step, desc=f"[{phase_name}]",
+    progress_bar = tqdm(range(phase_steps), initial=phase_step, desc=f"[{phase_name}]",
                         disable=not accelerator.is_local_main_process)
 
-    remaining = args.steps_per_phase - phase_step
+    remaining = phase_steps - phase_step
     steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_epochs = math.ceil(remaining / steps_per_epoch) if steps_per_epoch > 0 else 0
 
@@ -440,9 +445,9 @@ def train_phase(
             progress_bar.set_postfix(loss=logs["loss"], lr=logs["lr"])
             accelerator.log(logs, step=global_step)
 
-            if phase_step >= args.steps_per_phase:
+            if phase_step >= phase_steps:
                 break
-        if phase_step >= args.steps_per_phase:
+        if phase_step >= phase_steps:
             break
 
     accelerator.wait_for_everyone()
@@ -577,6 +582,18 @@ def main():
     logger.info(f"Loaded {len(all_records):,} records from manifest")
     tier_records = assign_tiers(all_records)
 
+    # ---- Compute per-phase steps from epochs ----
+    eff_batch = args.train_batch_size * args.gradient_accumulation_steps * accelerator.num_processes
+    steps_per_phase = {}
+    total_steps = 0
+    for phase_name in PHASES:
+        n = len(tier_records[phase_name])
+        steps_per_phase[phase_name] = (n // eff_batch) * args.epochs_per_phase
+        total_steps += steps_per_phase[phase_name]
+        logger.info(f"  Phase {phase_name}: {steps_per_phase[phase_name]} steps "
+                     f"({n:,} samples, {args.epochs_per_phase} epochs)")
+    logger.info(f"  Total steps: {total_steps:,}")
+
     # ---- Resume ----
     global_step = 0
     resume_phase = None
@@ -628,6 +645,7 @@ def main():
             phase_name, tier_records[phase_name], args, accelerator,
             controlnet, transformer, vae, noise_scheduler_copy,
             encode_prompts, weight_dtype, global_step,
+            phase_steps=steps_per_phase[phase_name],
             resume_phase_step=phase_resume_step,
         )
 
